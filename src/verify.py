@@ -1,7 +1,14 @@
-"""Six-check verification report for the processed splits.
+"""Verification report for the processed splits.
 
-Per CLAUDE.md §Verification — must print PASS / WARN / FAIL for every check
-and exit non-zero if any check fails.
+Two phases of checks:
+
+1. **Statistical / structural checks** (1-6): coverage, row counts, distributions,
+   PA boundary correctness — the original CLAUDE.md §Verification spec.
+2. **Drop-rule compliance checks** (7-14): explicitly verify every filter rule
+   we documented in ``docs/FILTER_RULES.md`` actually fired and the post-filter
+   data complies. Belt-and-suspenders against rule regressions.
+
+Print PASS / WARN / FAIL for every check; exit non-zero if any FAIL.
 """
 from __future__ import annotations
 
@@ -11,6 +18,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from src.filter import (
+    DROP_PITCH_TYPES,
+    DROP_EVENTS,
+    FASTBALL_TYPES,
+    POSITION_PLAYER_FB_MAX_MPH,
+    REQUIRED_NONNULL_COLS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +162,144 @@ def check_pitch_number_monotonic(df: pd.DataFrame) -> CheckResult:
 
 
 # --------------------------------------------------------------------------- #
+# Drop-rule compliance checks (7-14)
+# --------------------------------------------------------------------------- #
+
+
+def check_required_nonnull(df: pd.DataFrame) -> CheckResult:
+    """Every row must have non-null values for every column in
+    ``REQUIRED_NONNULL_COLS``. This is the strictest data-cleanliness check —
+    if any row has a null in any required column, the PA-atomic filter rule
+    failed somewhere upstream."""
+    bad = {}
+    for col in REQUIRED_NONNULL_COLS:
+        if col not in df.columns:
+            bad[col] = "MISSING_COLUMN"
+            continue
+        n_null = int(df[col].isna().sum())
+        if n_null > 0:
+            bad[col] = n_null
+    status = "PASS" if not bad else "FAIL"
+    return CheckResult(
+        name="7. all REQUIRED_NONNULL_COLS are non-null on every row",
+        status=status,
+        summary=f"{len(REQUIRED_NONNULL_COLS)} required cols checked, {len(bad)} have nulls",
+        detail="" if not bad else f"violations: {bad}",
+    )
+
+
+def check_pitch_type_compliance(df: pd.DataFrame) -> CheckResult:
+    """No row should have ``pitch_type`` in {PO, UN} or null."""
+    n_drop = int(df["pitch_type"].isin(DROP_PITCH_TYPES).sum())
+    n_null = int(df["pitch_type"].isna().sum())
+    bad = n_drop + n_null
+    status = "PASS" if bad == 0 else "FAIL"
+    return CheckResult(
+        name=f"8. no pitch_type in {{{', '.join(sorted(DROP_PITCH_TYPES))}}} or null",
+        status=status,
+        summary=f"{bad} non-compliant rows (PO/UN: {n_drop}, null: {n_null})",
+    )
+
+
+def check_intent_ball_compliance(df: pd.DataFrame) -> CheckResult:
+    """No row should have ``description == 'intent_ball'`` (pre-2017 IBB)."""
+    n_bad = int((df["description"] == "intent_ball").sum())
+    status = "PASS" if n_bad == 0 else "FAIL"
+    return CheckResult(
+        name="9. no description == 'intent_ball'",
+        status=status,
+        summary=f"{n_bad} non-compliant rows",
+    )
+
+
+def check_drop_events_compliance(df: pd.DataFrame) -> CheckResult:
+    """No row should have ``events in DROP_EVENTS`` (intent_walk, truncated_pa)."""
+    n_bad = int(df["events"].isin(DROP_EVENTS).sum())
+    bad_breakdown = df.loc[df["events"].isin(DROP_EVENTS), "events"].value_counts().to_dict()
+    status = "PASS" if n_bad == 0 else "FAIL"
+    return CheckResult(
+        name=f"10. no events in {sorted(DROP_EVENTS)}",
+        status=status,
+        summary=f"{n_bad} non-compliant rows",
+        detail="" if not bad_breakdown else f"breakdown: {bad_breakdown}",
+    )
+
+
+def check_terminal_per_pa(df: pd.DataFrame) -> CheckResult:
+    """Every PA must have exactly one terminal pitch (events.notna().sum() == 1).
+    PAs with 0 terminal pitches (inning ended on basepaths) and >1 (impossible)
+    are both data-integrity violations after filtering."""
+    terms = df.groupby(PA_KEYS, sort=False)["events"].apply(lambda s: s.notna().sum())
+    bad = terms[terms != 1]
+    n_zero = int((bad == 0).sum())
+    n_multi = int((bad > 1).sum())
+    status = "PASS" if len(bad) == 0 else "FAIL"
+    return CheckResult(
+        name="11. every PA has exactly one terminal pitch",
+        status=status,
+        summary=f"PAs with !=1 terminals: {len(bad)} (zero={n_zero}, multi={n_multi})",
+        detail="" if len(bad) == 0 else f"first 5 bad PAs: {bad.head(5).to_dict()}",
+    )
+
+
+def check_pitch_idx_contiguous(df: pd.DataFrame) -> CheckResult:
+    """Within every PA, ``pitch_idx_in_pa`` must run 0..len-1 with no gaps.
+    Stronger than monotonic check 6 — also requires zero-indexed start."""
+    if "pitch_idx_in_pa" not in df.columns:
+        return CheckResult(
+            name="12. pitch_idx_in_pa runs 0..len-1 within each PA",
+            status="WARN",
+            summary="column not present (pre-derived data?)",
+        )
+    g = df.groupby(PA_KEYS, sort=False)["pitch_idx_in_pa"]
+    bad = g.apply(lambda s: list(s) != list(range(len(s))))
+    n_bad = int(bad.sum())
+    status = "PASS" if n_bad == 0 else "FAIL"
+    return CheckResult(
+        name="12. pitch_idx_in_pa runs 0..len-1 within each PA",
+        status=status,
+        summary=f"{n_bad} bad PAs",
+    )
+
+
+def check_game_type_regular(df: pd.DataFrame) -> CheckResult:
+    """All rows must come from regular-season games (game_type == 'R')."""
+    counts = df["game_type"].value_counts(dropna=False).to_dict()
+    n_bad = int((df["game_type"] != "R").sum())
+    status = "PASS" if n_bad == 0 else "FAIL"
+    return CheckResult(
+        name="13. all rows have game_type == 'R'",
+        status=status,
+        summary=f"non-'R' rows: {n_bad}",
+        detail="" if n_bad == 0 else f"game_type counts: {counts}",
+    )
+
+
+def check_no_position_player_pitchers(df: pd.DataFrame) -> CheckResult:
+    """After filtering, no remaining pitcher should have a season-max
+    ``release_speed`` across fastball types {FF, SI, FC} below the
+    ``POSITION_PLAYER_FB_MAX_MPH`` threshold. If any are found, the
+    position-player rule didn't fire correctly."""
+    fb = df[df["pitch_type"].isin(FASTBALL_TYPES) & df["release_speed"].notna()]
+    if fb.empty:
+        return CheckResult(
+            name="14. no surviving position-player pitchers (max FB < threshold)",
+            status="WARN",
+            summary="no fastball rows to evaluate",
+        )
+    max_fb = fb.groupby("pitcher")["release_speed"].max()
+    bad = max_fb[max_fb < POSITION_PLAYER_FB_MAX_MPH]
+    n_bad = len(bad)
+    status = "PASS" if n_bad == 0 else "FAIL"
+    return CheckResult(
+        name=f"14. no surviving pitchers with max FB < {POSITION_PLAYER_FB_MAX_MPH:.0f} mph",
+        status=status,
+        summary=f"{n_bad} pitchers below threshold",
+        detail="" if n_bad == 0 else f"first 5: {bad.head(5).to_dict()}",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Driver + formatting
 # --------------------------------------------------------------------------- #
 
@@ -154,12 +307,22 @@ def check_pitch_number_monotonic(df: pd.DataFrame) -> CheckResult:
 def run_all_checks(splits_dir: Path) -> list[CheckResult]:
     df = _load_concat(splits_dir)
     return [
+        # Statistical / structural (1-6)
         check_delta_run_exp_coverage(df),
         check_row_count(df),
         check_pitch_type_distribution(df),
         check_reward_sanity(df),
         check_pa_within_game(df),
         check_pitch_number_monotonic(df),
+        # Drop-rule compliance (7-14)
+        check_required_nonnull(df),
+        check_pitch_type_compliance(df),
+        check_intent_ball_compliance(df),
+        check_drop_events_compliance(df),
+        check_terminal_per_pa(df),
+        check_pitch_idx_contiguous(df),
+        check_game_type_regular(df),
+        check_no_position_player_pitchers(df),
     ]
 
 
