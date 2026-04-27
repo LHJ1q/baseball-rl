@@ -113,6 +113,17 @@ baseball-rl/
 └── tests/                   # 65 unit tests across all modules
 ```
 
+## Five-season dataset (2021–2025) — current state
+
+| Stage | Output |
+|---|---|
+| Raw pulls | 35 month files, 516 MB |
+| Filtered (per season) | 5 × ~700K pitches → **3.46M total pitches across all seasons** |
+| Splits (year-level) | train: 2.78M rows / 714K PAs (2021-2024) · val: 397K / 103K PAs (2025 Apr–Jul 15) · test: 287K / 74K PAs (2025 Jul 16–Oct) |
+| Vocabularies | 17 pitch types · 13 descriptions · **1,570 pitchers** · **1,448 batters** |
+| Lookup tables | `pitcher_arsenal.parquet` 6,985 (pitcher, type) groups · `batter_profile.parquet` 13,290 (batter, type) groups |
+| Verify | filter 6/6 PASS · tokens 8/8 PASS |
+
 ## Status
 
 - Phases 1–8: complete

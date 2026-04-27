@@ -18,8 +18,12 @@ PA_KEYS = ["game_pk", "at_bat_number"]
 SORT_KEYS = ["game_date", "game_pk", "at_bat_number", "pitch_number"]
 
 MAINSTREAM_PITCH_TYPES = {"FF", "SL", "CH", "SI", "CU", "FC", "FS", "KC", "ST", "SV"}
-EXPECTED_TOTAL_LOW = 600_000
-EXPECTED_TOTAL_HIGH = 800_000
+# Per-season band based on 2024 actuals (~700K pitches/season). The check
+# auto-scales by the number of distinct seasons in the data so the same
+# threshold works for single-year (within_season scheme) and multi-year
+# (year_level scheme) splits.
+EXPECTED_PER_SEASON_LOW = 600_000
+EXPECTED_PER_SEASON_HIGH = 800_000
 DELTA_RUN_EXP_MIN_COVERAGE = 0.95
 PITCH_TYPE_MIN_COVERAGE = 0.95
 
@@ -62,15 +66,14 @@ def check_delta_run_exp_coverage(df: pd.DataFrame) -> CheckResult:
 
 def check_row_count(df: pd.DataFrame) -> CheckResult:
     n = len(df)
-    if EXPECTED_TOTAL_LOW <= n <= EXPECTED_TOTAL_HIGH:
-        status = "PASS"
-    else:
-        status = "WARN"
+    n_seasons = max(1, df["game_date"].dt.year.nunique())
+    lo, hi = EXPECTED_PER_SEASON_LOW * n_seasons, EXPECTED_PER_SEASON_HIGH * n_seasons
+    status = "PASS" if lo <= n <= hi else "WARN"
     return CheckResult(
         name="2. total row count",
         status=status,
-        summary=f"{n:,}",
-        detail=f"expected ~700K (band {EXPECTED_TOTAL_LOW:,}..{EXPECTED_TOTAL_HIGH:,})",
+        summary=f"{n:,} ({n_seasons} season{'s' if n_seasons > 1 else ''})",
+        detail=f"expected band {lo:,}..{hi:,} ({EXPECTED_PER_SEASON_LOW:,}..{EXPECTED_PER_SEASON_HIGH:,} per season)",
     )
 
 
