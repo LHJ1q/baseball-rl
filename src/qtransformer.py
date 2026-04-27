@@ -296,8 +296,14 @@ class QTransformer(nn.Module):
         self,
         batch: PABatch,
         repertoire_mask: torch.Tensor | None = None,  # (B, T, n_pitch_type) bool, True = allowed
+        return_logits: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Greedy policy: argmax type → conditional argmax x → conditional argmax z."""
+        """Greedy policy: argmax type → conditional argmax x → conditional argmax z.
+
+        If ``return_logits=True``, the returned dict also includes the per-axis
+        Q-logits (``q_type_logits``, ``q_x_logits``, ``q_z_logits``). x/z logits
+        are conditioned on the policy's chosen type/x at each step.
+        """
         h = self.encode(batch)
         h_pre = h[:, 0::2]
 
@@ -316,12 +322,17 @@ class QTransformer(nn.Module):
         q_z_logits = self.q_head_z(torch.cat([h_pre, e_pt, e_x, ars_chosen, bpt_chosen], dim=-1))
         chosen_z = q_z_logits.argmax(dim=-1)
 
-        return {
+        out = {
             "pitch_type": chosen_type,
             "x_bin": chosen_x,
             "z_bin": chosen_z,
             "valid_mask": batch.valid_mask,
         }
+        if return_logits:
+            out["q_type_logits"] = q_type_logits
+            out["q_x_logits"] = q_x_logits
+            out["q_z_logits"] = q_z_logits
+        return out
 
 
 # --------------------------------------------------------------------------- #

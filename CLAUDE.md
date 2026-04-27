@@ -20,6 +20,9 @@ DT conditions on return-to-go but doesn't explicitly learn a value function — 
 - **Phase 5 (tokenization) — DONE.** 8/8 verification checks PASS. Per-pitch tokens + pitcher-arsenal + batter-profile + vocab.json under `data/tokens/`.
 - **Phases 6+7 (state encoder + Q-Transformer architecture) — DONE.** `src/encoder.py`, `src/dataset.py`, `src/qtransformer.py`. Strongest smoke test (10 checks) PASS on Macbook with tiny config (130K params).
 - **Phase 8 (offline RL trainer) — DONE.** `src/trainer.py`, `src/eval.py`, `scripts/08_train.py`. End-to-end smoke-train (Macbook MPS, 2 epochs on 64 PAs) verified loop, save/load, resume, and refuse-on-collision behaviors. Real training on the Blackwell RTX Pro 4500 is one `git push` away.
+- **Phase 9 (off-policy evaluation) — DONE.** Two complementary parts:
+  - **Part A — Behavioral / distributional analysis** (`src/ope_metrics.py`, `src/report.py`, `scripts/09_behavioral.py`). Pitch-type top-1/top-3 agreement, coarse 4×4 zone agreement, spatial-distance metrics, KL[π_learned ∥ behavior], pitch-type distribution shift, segment breakdowns (by count / matchup / PA-length), pitcher-blind variants. Outputs a markdown report under the run dir. Runs in seconds on val/test against any IQL checkpoint.
+  - **Part B — Fitted Q Evaluation (FQE)** (`src/fqe.py`, `scripts/10_fqe.py`). Trains a separate Q-network with the SARSA target `Q^π(s,a) ← r + γ·Q^π(s', π_learned(s'))` against the frozen policy, then estimates per-PA expected return on val and test (vs the empirical behavior baseline). Macbook smoke-train runs in seconds; real GPU training matches Phase 8 wall-clock (~1-2 hours).
 - **Multi-year scaling — pending.** Code is year-agnostic; the data download phase needs to be re-run for years 2021–2025 once the model is validated. See "Multi-year extension" below.
 
 Heavy training runs on a separate Linux server / Colab. Macbook PyTorch is fine for the smoke test and for prototyping; full training runs are NOT to happen on Macbook.
@@ -249,6 +252,37 @@ The `gap` column is the pitcher-blind eval signal: bigger = more pitcher-specifi
 
 Wall-clock note: at 12M params + max_seq_len=64 + batch 512 PAs, the bottleneck is parquet I/O + Python `pa_collate`, not the GPU. Earlier "~30 min/epoch / ~20 hours total" estimates were extrapolated from a much larger model and are wrong; revised after the 5-season pipeline ran in 2026-04. Increase `--batch-size` to 1024 or 2048 (24 GB has plenty of headroom) if the dataloader can keep up.
 
+### Phase 9 — Off-policy evaluation (DONE)
+
+Two complementary parts. Both run *after* Phase 8 produces a trained checkpoint at `data/runs/{run_name}/checkpoint_best.pt`.
+
+**Part A — Behavioral / distributional analysis** (`src/ope_metrics.py`, `src/report.py`, `scripts/09_behavioral.py`).
+
+Descriptive — measures *where* the learned policy agrees / disagrees with what real MLB pitchers actually threw, on the same states. No value claim; just a portrait. Aggregate metrics:
+
+- Pitch-type top-1 / top-3 agreement (17 classes; behavior-marginal baseline ~32%)
+- Coarse-zone (type × 4×4 macro-zone) top-1 agreement
+- Spatial distance (predicted bin center vs actual landing point): mean / median / p75 / fraction within 6 inches
+- KL[π_learned ∥ behavior] over the marginal pitch_type distribution
+- Pitcher-blind variants (pitcher embedding zeroed) — diagnostic for "does the model rely on player identity vs general rules"
+
+Plus per-segment breakdowns by `(balls, strikes)` count, `(p_throws, stand)` matchup, and PA length. Output: `data/runs/{run}/behavioral_report_{val|test}.md`.
+
+CLI: `python scripts/09_behavioral.py --run-name <run> --preset v1 --split val`. Runs in seconds.
+
+**Part B — Fitted Q Evaluation (FQE)** (`src/fqe.py`, `scripts/10_fqe.py`).
+
+Prescriptive — trains a *separate* Q-network `Q^π` on the SARSA target `Q^π(s,a) ← r + γ·Q^π(s', π_learned(s'))` against a frozen `π_learned`, then estimates per-PA expected return on val and test. Compared to the empirical mean reward (the behavior baseline). Outputs the policy's "advantage in run units" — defensible scalar claim like *"the learned policy is +0.018 runs better per PA than league average"*.
+
+The FQE model uses the same `QTransformer` architecture as the IQL preset and is initialized from the policy's weights for faster convergence. `π_learned` is held frozen during FQE training (verified in `tests/test_fqe.py::test_fqe_policy_model_remains_frozen`).
+
+CLI: `python scripts/10_fqe.py --run-name <run> --preset v1 --epochs 20`. Wall-clock matches Phase 8 (~1-2 hours on Blackwell). Macbook smoke-train: `--smoke-train` runs in seconds on a tiny subset.
+
+**When to use which:**
+- During iteration (after each IQL training run): Part A — fast, diagnostic, catches catastrophic failures
+- For final reports / value claims: Part B — quantitative, defensible
+- They're complementary: A explains *where* the policy differs; B says *whether* it's better
+
 ### Multi-year extension (when ready to scale beyond 2024)
 
 Plan: train on 4 full clean seasons **2021–2024**, hold out 2025 split for val/test (val = 2025 first half, test = 2025 second half).
@@ -336,7 +370,10 @@ baseball-rl/
 │   ├── qtransformer.py
 │   ├── configs.py
 │   ├── eval.py
-│   └── trainer.py
+│   ├── trainer.py
+│   ├── ope_metrics.py
+│   ├── report.py
+│   └── fqe.py
 ├── scripts/
 │   ├── 01_download.py
 │   ├── 02_filter.py
@@ -345,7 +382,9 @@ baseball-rl/
 │   ├── 05_tokenize.py
 │   ├── 06_verify_tokens.py
 │   ├── 07_smoke_test.py
-│   └── 08_train.py
+│   ├── 08_train.py
+│   ├── 09_behavioral.py
+│   └── 10_fqe.py
 └── tests/
     ├── test_filter.py
     ├── test_tokenize.py
@@ -353,7 +392,9 @@ baseball-rl/
     ├── test_qtransformer.py
     ├── test_configs.py
     ├── test_eval.py
-    └── test_trainer.py
+    ├── test_trainer.py
+    ├── test_ope_metrics.py
+    └── test_fqe.py
 ```
 
 `data/` is gitignored. Raw parquet for 2024 alone is ~115 MB.
@@ -373,10 +414,10 @@ baseball-rl/
 
 ## What is OUT of scope right now
 
-- **Phase 9 — Off-policy evaluation framework** (FQE, weighted IS, distributional analysis vs behavior, reward decomposition by count/handedness/pitcher tier). This is the next phase to build after we have a trained model.
 - Pretrained or external player embeddings (Heaton & Mitra, etc.) — see "Future tokenization improvements" for the path.
 - CQL implementation (we chose IQL for v1).
 - Pitcher-embedding dropout *during training* (the "general rule maker" booster). Plumbed as `TrainerConfig.pitcher_dropout=0.0` so it's available; user opted to try it later.
+- Importance-sampling / weighted-IS / doubly-robust OPE estimators (skipped in v1 in favor of FQE; FQE is the standard companion to IQL and has lower variance for our regime).
 - Heavy training runs on this Macbook. PyTorch is installed locally for `--smoke-train` only; anything that needs a GPU or > a few minutes of CPU time is out of scope here.
 
 If a task seems to require any of the above, **stop and ask** rather than scope-creep.
