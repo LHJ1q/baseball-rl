@@ -245,7 +245,9 @@ The `gap` column is the pitcher-blind eval signal: bigger = more pitcher-specifi
 | IQL τ (expectile) | 0.7 | scan {0.7, 0.8, 0.9} if eval is poor |
 | IQL β (AWR temperature) | 3.0 | scan 3-10 if needed |
 | Epochs | 40 (start) | early-stop on val Q-loss + OPE |
-| Wall-clock estimate | ~30 min/epoch, ~20 hours total | overnight on Blackwell |
+| Wall-clock estimate | ~1-2 min/epoch, **~1-2 hours total** | dataloader-bound; A100 / Blackwell RTX Pro 4500 / any modern GPU all fine (model too small to FLOP-bind). |
+
+Wall-clock note: at 12M params + max_seq_len=64 + batch 512 PAs, the bottleneck is parquet I/O + Python `pa_collate`, not the GPU. Earlier "~30 min/epoch / ~20 hours total" estimates were extrapolated from a much larger model and are wrong; revised after the 5-season pipeline ran in 2026-04. Increase `--batch-size` to 1024 or 2048 (24 GB has plenty of headroom) if the dataloader can keep up.
 
 ### Multi-year extension (when ready to scale beyond 2024)
 
