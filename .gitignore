@@ -1,0 +1,14 @@
+data/
+scratch/
+*.pt
+
+# Local Claude Code session state (transcripts, hooks, etc.) — not part of the project
+.claude/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.venv/
+*.egg-info/
+build/
+dist/

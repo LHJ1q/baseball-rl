@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "baseball-rl"
+version = "0.1.0"
+description = "Offline RL Q-Transformer for MLB pitch selection — Statcast data pipeline."
+requires-python = ">=3.10"
+dependencies = [
+    "pandas==2.3.3",
+    "pyarrow==24.0.0",
+    "numpy==2.2.6",
+    "pybaseball==2.2.7",
+    "tqdm==4.67.3",
+    "torch>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
