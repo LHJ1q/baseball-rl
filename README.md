@@ -22,7 +22,7 @@ Offline reinforcement learning for MLB pitch selection. A **Q-Transformer** trai
 | 8. Train | `scripts/08_train.py` | `data/runs/{run_name}/` (config, metrics, checkpoints) |
 | 9. Behavioral eval | `scripts/09_behavioral.py` | `data/runs/{run_name}/behavioral_report_{split}.md` |
 | 10. FQE eval | `scripts/10_fqe.py` | FQE checkpoint + per-PA value estimates on val + test |
-| Audit | `scripts/audit.py` | 16-check framework audit (gradient flow, field alignment, FQE freeze, save/load round-trip) |
+| Audit | `scripts/audit.py` | 24-check framework audit (gradient flow, field alignment, FQE freeze, save/load round-trip, real-data integrity, modern init) |
 
 The full filter + tokenize spec lives in `docs/FILTER_RULES.md` and `CLAUDE.md`. Read those before changing rules or extending seasons.
 
@@ -130,7 +130,7 @@ baseball-rl/
 ├── data/                    # gitignored
 ├── src/                     # download / filter / splits / verify / tokenize / encoder / dataset / qtransformer / configs / eval / trainer / ope_metrics / report / fqe
 ├── scripts/                 # 01_download → 10_fqe + audit.py
-└── tests/                   # 80 unit tests across all modules
+└── tests/                   # 100 unit tests across all modules (1 CUDA-gated skip on Macbook)
 ```
 
 ## Five-season dataset (2021–2025) — current state
@@ -142,12 +142,12 @@ baseball-rl/
 | Splits (year-level) | train: 2.78M rows / 714K PAs (2021-2024) · val: 397K / 103K PAs (2025 Apr–Jul 15) · test: 287K / 74K PAs (2025 Jul 16–Oct) |
 | Vocabularies | 17 pitch types · 13 descriptions · **1,570 pitchers** · **1,448 batters** |
 | Lookup tables | `pitcher_arsenal.parquet` 6,985 (pitcher, type) groups · `batter_profile.parquet` 13,290 (batter, type) groups |
-| Verify | filter 14/14 PASS · tokens 8/8 PASS · framework audit 16/16 PASS |
+| Verify | filter 14/14 PASS · tokens 8/8 PASS · framework audit 24/24 PASS |
 
 ## Status
 
 - **Phases 1–9: complete.** Data pipeline (download → filter → splits → verify → tokenize → verify) and model stack (encoder → Q-Transformer → IQL trainer → behavioral eval → FQE) are all built, tested, and pushed.
-- Tests: **80/80 passing**. Audit: **16/16 PASS**. Smoke: **10/10 PASS** on both presets.
+- Tests: **100 passing / 1 skipped** (CUDA-gated `torch.compile` round-trip). Audit: **24/24 PASS**. Smoke: **9 PASS / 1 WARN** (`smoke` preset) and **8 PASS / 2 WARN** (`v1` preset); WARNs are benign (causal-mask check skipped when first PA is length 1; per-axis IQL's q_loss_type non-monotonic during overfit because its target is `max q_x_logits.detach()`, itself learning — documented behavior).
 - **Next step:** run `scripts/08_train.py --preset v1` on a GPU box, then run `scripts/09_behavioral.py` and `scripts/10_fqe.py` against the resulting checkpoint.
 
 ## License
