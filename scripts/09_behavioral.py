@@ -48,6 +48,11 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--no-pitcher-blind", action="store_true")
     parser.add_argument("--no-segments", action="store_true")
+    parser.add_argument(
+        "--repertoire-mask-min-count", type=int, default=0,
+        help="If >0, mask the policy's argmax to per-pitcher repertoire types with count >= N. "
+             "Default 0 = mask disabled (recommended; arsenal data is noisy for low-sample pitchers).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -93,6 +98,7 @@ def main() -> None:
     metrics = evaluate_behavioral(
         model, loader, device=device,
         include_pitcher_blind=not args.no_pitcher_blind,
+        repertoire_mask_min_count=args.repertoire_mask_min_count,
     )
     print(f"  aggregate done in {time.time() - t0:.1f}s")
 
@@ -100,7 +106,10 @@ def main() -> None:
     if not args.no_segments:
         print("running segment breakdowns...")
         t0 = time.time()
-        segments = segment_breakdowns(model, loader, device=device)
+        segments = segment_breakdowns(
+            model, loader, device=device,
+            repertoire_mask_min_count=args.repertoire_mask_min_count,
+        )
         print(f"  segments done in {time.time() - t0:.1f}s")
 
     out_path = run_dir / f"behavioral_report_{args.split}.md"

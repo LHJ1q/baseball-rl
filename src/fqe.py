@@ -33,7 +33,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.dataset import PABatch, PitchPADataset, pa_collate
-from src.qtransformer import QTransformer
+from src.qtransformer import QTransformer, repertoire_mask_from_batch
 from src.trainer import cosine_warmup_lr
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,7 @@ def fqe_loss(
     batch: PABatch,
     *,
     gamma: float = 1.0,
+    repertoire_mask_min_count: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Compute the FQE TD loss for one batch.
 
@@ -82,6 +83,11 @@ def fqe_loss(
     ``r + γ · q_z(s', π_learned(s'))``. The shallow heads ``q_head_type`` and
     ``q_head_x`` are intentionally NOT trained here — see :func:`_gather_qz_at_actions`
     for why (a per-axis max would compute Q*, biasing FQE estimates upward).
+
+    ``repertoire_mask_min_count`` (default 0 = disabled) lets you mask
+    ``π_learned`` to a per-pitcher repertoire when computing the bootstrap
+    action. When > 0, FQE evaluates the *masked* policy; when 0, it evaluates
+    the unmasked argmax. Set to whatever matches your intended deployment.
 
     Both models share the same architecture but are separate instances —
     ``policy_model`` is ``π_learned`` (frozen) and ``fqe_model`` is the
@@ -96,9 +102,11 @@ def fqe_loss(
         batch.post_cat["pitch_type_id"], batch.post_cat["x_bin"], batch.post_cat["z_bin"],
     )
 
-    # π_learned's actions at every state (its argmax greedy policy).
+    # π_learned's actions at every state (its argmax greedy policy, optionally
+    # constrained by the per-pitcher repertoire mask).
     with torch.no_grad():
-        policy_out = policy_model.policy(batch)
+        rmask = repertoire_mask_from_batch(batch, repertoire_mask_min_count)
+        policy_out = policy_model.policy(batch, repertoire_mask=rmask)
         q_z_at_policy = _gather_qz_at_actions(
             fqe_model, h_fqe,
             batch.arsenal_per_type, batch.batter_per_type,
@@ -144,6 +152,11 @@ class FQETrainerConfig:
     gamma: float = 1.0
     bf16: bool = True
     seed: int = 0
+
+    # Repertoire mask threshold (default 0 = mask disabled). Set > 0 to constrain
+    # ``π_learned``'s argmax to pitch types this pitcher has thrown at least N times in train.
+    # See src/qtransformer.py:repertoire_mask_from_batch for the rationale (default OFF).
+    repertoire_mask_min_count: int = 0
 
 
 class FQETrainer:
@@ -254,12 +267,20 @@ class FQETrainer:
     def step(self, batch: PABatch) -> dict[str, float]:
         self.fqe_model.train()
         batch = batch.to(self.device)
+        # Runtime guard: every PA must have exactly one terminal pitch
+        # (load-bearing for shift_v_for_next_state's zero pad and FQE's q_next shift).
+        assert (batch.is_terminal.sum(dim=1) == 1).all(), \
+            "is_terminal invariant violated — check filter pipeline"
         lr = self._set_lr()
         self.optimizer.zero_grad(set_to_none=True)
 
         autocast_dtype = torch.bfloat16 if self._use_bf16 else None
         with torch.autocast(device_type=self.device.type, dtype=autocast_dtype, enabled=self._use_bf16):
-            losses = fqe_loss(self.fqe_model, self.policy_model, batch, gamma=self.cfg.gamma)
+            losses = fqe_loss(
+                self.fqe_model, self.policy_model, batch,
+                gamma=self.cfg.gamma,
+                repertoire_mask_min_count=self.cfg.repertoire_mask_min_count,
+            )
             loss = losses["fqe_loss"]
 
         loss.backward()
@@ -285,7 +306,11 @@ class FQETrainer:
             n = float(batch.valid_mask.sum().item())
             if n == 0:
                 continue
-            losses = fqe_loss(self.fqe_model, self.policy_model, batch, gamma=self.cfg.gamma)
+            losses = fqe_loss(
+                self.fqe_model, self.policy_model, batch,
+                gamma=self.cfg.gamma,
+                repertoire_mask_min_count=self.cfg.repertoire_mask_min_count,
+            )
             sum_loss += float(losses["fqe_loss"].item()) * n
             sum_q += float(losses["q_mean"].item()) * n
             sum_target += float(losses["target_mean"].item()) * n
@@ -365,6 +390,7 @@ def estimate_pa_values(
     loader,
     *,
     device,
+    repertoire_mask_min_count: int = 0,
 ) -> dict[str, float]:
     """Estimate the per-PA expected return under ``π_learned`` using the
     trained FQE model. Returns aggregate stats over the dataset.
@@ -372,6 +398,10 @@ def estimate_pa_values(
     For each PA, the value at the FIRST pitch (state s_0) under π_learned is
     Q^π(s_0, π_learned(s_0)). Aggregating across PAs gives the per-PA mean
     estimated value.
+
+    ``repertoire_mask_min_count`` (default 0 = disabled): if > 0, ``π_learned``
+    is constrained to per-pitcher repertoire types via the mask. Use the same
+    setting that you would deploy with.
     """
     fqe_model.eval()
     policy_model.eval()
@@ -383,7 +413,8 @@ def estimate_pa_values(
     for batch in loader:
         batch = batch.to(device)
         h = fqe_model.encode(batch)[:, 0::2]
-        policy_out = policy_model.policy(batch)
+        rmask = repertoire_mask_from_batch(batch, repertoire_mask_min_count)
+        policy_out = policy_model.policy(batch, repertoire_mask=rmask)
         q_at_policy = _gather_qz_at_actions(
             fqe_model, h,
             batch.arsenal_per_type, batch.batter_per_type,

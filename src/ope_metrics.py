@@ -38,7 +38,7 @@ import torch
 
 from src.dataset import PABatch
 from src.eval import _zeroed_pitcher_embedding
-from src.qtransformer import QTransformer
+from src.qtransformer import QTransformer, repertoire_mask_from_batch
 from src.tokenize import N_X_BINS, N_Z_BINS, X_BIN_HI, X_BIN_LO, Z_BIN_HI, Z_BIN_LO
 
 # Coarse macro-zone grid for "did the model anticipate roughly where the
@@ -96,11 +96,17 @@ class PerPitchPredictions:
 
 @torch.no_grad()
 def predict_batch(
-    model: QTransformer, batch: PABatch, *, top_k: int = 3
+    model: QTransformer, batch: PABatch, *, top_k: int = 3, repertoire_mask_min_count: int = 0,
 ) -> PerPitchPredictions:
     """Run the policy + extract actuals on one batch. Returns flattened
-    predictions over only valid (non-padded) pitches."""
-    out = model.policy(batch, return_logits=True)
+    predictions over only valid (non-padded) pitches.
+
+    ``repertoire_mask_min_count`` (default 0 = disabled) constrains the
+    policy's argmax to per-pitcher repertoire types. Match your deployment
+    setting if you want behavioral metrics to reflect the deployed policy.
+    """
+    rmask = repertoire_mask_from_batch(batch, repertoire_mask_min_count)
+    out = model.policy(batch, repertoire_mask=rmask, return_logits=True)
     valid = batch.valid_mask  # (B, T)
 
     # Top-K pitch types. Mask invalid logits to -inf first.
@@ -250,21 +256,27 @@ def evaluate_behavioral(
     *,
     device,
     include_pitcher_blind: bool = True,
+    repertoire_mask_min_count: int = 0,
 ) -> BehavioralMetrics:
     """Run the full Part-A behavioral evaluation across a DataLoader."""
     model.eval()
     preds: list[PerPitchPredictions] = []
     for batch in loader:
         batch = batch.to(device)
-        preds.append(predict_batch(model, batch))
+        preds.append(predict_batch(model, batch, repertoire_mask_min_count=repertoire_mask_min_count))
     metrics = metrics_from_predictions(preds)
 
     if include_pitcher_blind and metrics.n_pitches > 0:
-        with _zeroed_pitcher_embedding(model):
-            blind_preds: list[PerPitchPredictions] = []
-            for batch in loader:
-                batch = batch.to(device)
-                blind_preds.append(predict_batch(model, batch))
+        # Pitcher-blind variant: zero pitcher embedding AND blank arsenal_per_type
+        # so the model truly has no pitcher-specific info (the arsenal is keyed by
+        # (pitcher_id, pitch_type), so just zeroing the embedding leaks pitcher
+        # physics through the per-type lookup).
+        from src.eval import _fully_blinded_pitcher
+        blind_preds: list[PerPitchPredictions] = []
+        for batch in loader:
+            batch = batch.to(device)
+            with _fully_blinded_pitcher(model, batch):
+                blind_preds.append(predict_batch(model, batch, repertoire_mask_min_count=repertoire_mask_min_count))
         blind = metrics_from_predictions(blind_preds)
         metrics.pitch_type_top1_blind = blind.pitch_type_top1
         metrics.pitch_type_top3_blind = blind.pitch_type_top3
@@ -303,13 +315,14 @@ def segment_breakdowns(
     loader: Iterable,
     *,
     device,
+    repertoire_mask_min_count: int = 0,
 ) -> dict[str, pd.DataFrame]:
     """Returns ``{segment_name: DataFrame}`` for each segmenting axis."""
     model.eval()
     preds_list: list[PerPitchPredictions] = []
     for batch in loader:
         batch = batch.to(device)
-        preds_list.append(predict_batch(model, batch))
+        preds_list.append(predict_batch(model, batch, repertoire_mask_min_count=repertoire_mask_min_count))
     if not preds_list:
         return {}
 

@@ -221,6 +221,12 @@ class Trainer:
         """One optimizer step. Returns ``{q_loss, v_loss, lr, grad_norm}``."""
         self.model.train()
         batch = batch.to(self.device)
+        # Runtime guard: every PA must end with exactly one terminal pitch.
+        # Load-bearing for shift_v_for_next_state's zero pad — if the filter
+        # ever regresses and a PA has 0 or >1 terminals, the V bootstrap on
+        # the last position becomes garbage and silently corrupts training.
+        assert (batch.is_terminal.sum(dim=1) == 1).all(), \
+            "is_terminal invariant violated — check filter pipeline"
         lr = self._set_lr()
         self.optimizer.zero_grad(set_to_none=True)
 

@@ -576,6 +576,31 @@ def check_predict_batch_dtypes() -> CheckResult:
     )
 
 
+def check_repertoire_mask_default_is_disabled() -> CheckResult:
+    """Lock in the design choice that the repertoire mask defaults to OFF.
+    Future regressions that flip the default would fail this check immediately."""
+    from src.fqe import FQETrainerConfig
+    from src.qtransformer import repertoire_mask_from_batch
+
+    issues = []
+    if FQETrainerConfig().repertoire_mask_min_count != 0:
+        issues.append(f"FQETrainerConfig default min_count is {FQETrainerConfig().repertoire_mask_min_count}, expected 0")
+
+    batch = _make_batch()
+    if repertoire_mask_from_batch(batch, n_min=0) is not None:
+        issues.append("repertoire_mask_from_batch(n_min=0) should return None (disabled)")
+    mask = repertoire_mask_from_batch(batch, n_min=1)
+    if mask is None or mask.dtype != torch.bool:
+        issues.append("repertoire_mask_from_batch(n_min=1) should return a bool tensor")
+
+    return CheckResult(
+        "17. repertoire mask defaults to disabled (OFF)",
+        "PASS" if not issues else "FAIL",
+        f"FQETrainerConfig.repertoire_mask_min_count default = {FQETrainerConfig().repertoire_mask_min_count}",
+        detail="" if not issues else "; ".join(issues),
+    )
+
+
 def check_param_count_invariant() -> CheckResult:
     """Sanity: the v1 preset should have ~12M params; the smoke preset should
     have ~130-160K. Catches accidental architectural inflation."""
@@ -639,6 +664,7 @@ def main() -> None:
         check_disk_artifacts_present(),
         check_real_data_forward_runs(),
         check_predict_batch_dtypes(),
+        check_repertoire_mask_default_is_disabled(),
         check_param_count_invariant(),
     ]
     print(format_report(results))

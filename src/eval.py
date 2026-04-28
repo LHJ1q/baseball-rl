@@ -56,9 +56,13 @@ def eval_losses(model: QTransformer, batch: PABatch, gamma: float, tau: float) -
 def _zeroed_pitcher_embedding(model: QTransformer):
     """Temporarily zero the pitcher embedding row for every pitcher_id.
 
-    We do this by patching ``emb_pitcher.weight`` to zeros under a
-    ``no_grad`` context. Restore the original on exit so the model is unchanged
-    after evaluation.
+    Zeroes ``emb_pitcher.weight`` only — does NOT touch ``arsenal_per_type``.
+    For a TRUE pitcher-blind eval (where the model has no pitcher info at all)
+    use :func:`_fully_blinded_pitcher` instead — the arsenal is keyed by
+    ``(pitcher_id, pitch_type)`` and would otherwise leak the pitcher's
+    per-pitch-type physics into the Q-heads even with the embedding zeroed.
+
+    Restore on exit so the model is unchanged after evaluation.
     """
     emb = model.pre_encoder.emb_pitcher
     original = emb.weight.data.clone()
@@ -71,11 +75,45 @@ def _zeroed_pitcher_embedding(model: QTransformer):
             emb.weight.data.copy_(original)
 
 
+@contextmanager
+def _fully_blinded_pitcher(model: QTransformer, batch: PABatch):
+    """Truly blind the model to pitcher identity. Zeroes both:
+      1. ``model.pre_encoder.emb_pitcher.weight``, and
+      2. ``batch.arsenal_per_type`` to defaults (``count=0, low_sample=1.0``,
+         all stats ``= 0``) — matching the dataset's "unknown pitcher" fallback.
+
+    The arsenal lookup is keyed by ``(pitcher_id, pitch_type)`` and feeds the
+    pitcher's per-pitch-type physics into the Q-heads via the per-type join.
+    Zeroing only the embedding leaves this leak intact — which silently
+    understates the diagnostic gap. This context manager closes that leak.
+
+    Restores both on exit.
+    """
+    emb = model.pre_encoder.emb_pitcher
+    original_emb = emb.weight.data.clone()
+    original_arsenal = batch.arsenal_per_type.clone()
+    with torch.no_grad():
+        emb.weight.data.zero_()
+        batch.arsenal_per_type.zero_()
+        # ARSENAL_HEAD_FIELDS index 1 = 'low_sample'; set to 1.0 = "stranger pitcher"
+        batch.arsenal_per_type[..., 1] = 1.0
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            emb.weight.data.copy_(original_emb)
+            batch.arsenal_per_type.copy_(original_arsenal)
+
+
 def eval_pitcher_blind(
     model: QTransformer, batch: PABatch, gamma: float, tau: float
 ) -> dict[str, torch.Tensor]:
-    """Same Q+V losses, but with the pitcher embedding zeroed — measures the
-    'general policy' baseline (no pitcher identity info).
+    """Same Q+V losses, but with pitcher information FULLY blinded.
+
+    Uses :func:`_fully_blinded_pitcher` — zeroes both the pitcher embedding AND
+    ``arsenal_per_type`` (the per-(pitcher, pitch_type) physics lookup, keyed
+    by pitcher_id). The "gap" between this and the personalized loss is the
+    actual measure of how much the model relies on pitcher identity.
 
     NOTE on comparing this to the personalized loss: under per-axis IQL, the
     targets for ``q_loss_type`` and ``q_loss_x`` are derived from the model's
@@ -85,12 +123,10 @@ def eval_pitcher_blind(
     aggregate loss values are therefore not strictly comparable across the two
     runs in absolute units. The intended diagnostic — "did the loss go up
     under blinding" → "is the model relying on pitcher identity" — is still
-    valid in *relative* terms; it's just measuring "blind model fits its own
-    blind targets" vs "personalized model fits its own personalized targets,"
-    not a direct fit of the same target. ``q_loss_z``'s target is stationary
-    (depends only on r + γV(s')) and IS directly comparable across the two.
+    valid in *relative* terms. ``q_loss_z``'s target is stationary (depends
+    only on r + γV(s')) and IS directly comparable across the two.
     """
-    with _zeroed_pitcher_embedding(model):
+    with _fully_blinded_pitcher(model, batch):
         return eval_losses(model, batch, gamma, tau)
 
 

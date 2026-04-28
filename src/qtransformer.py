@@ -113,7 +113,11 @@ class QTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=self.cfg.n_layers)
+        self.transformer = nn.TransformerEncoder(
+            layer,
+            num_layers=self.cfg.n_layers,
+            enable_nested_tensor=False,  # not applicable with norm_first=True; silences warning
+        )
         self.norm_out = nn.LayerNorm(self.cfg.d_model)
 
         # Per-(pitcher, pitch_type) and per-(batter, pitch_type) feature
@@ -300,39 +304,48 @@ class QTransformer(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Greedy policy: argmax type → conditional argmax x → conditional argmax z.
 
+        Forces eval mode internally so dropout doesn't fire if a caller invokes
+        this on a model that's still in train mode. Restores prior mode on exit.
+
         If ``return_logits=True``, the returned dict also includes the per-axis
         Q-logits (``q_type_logits``, ``q_x_logits``, ``q_z_logits``). x/z logits
         are conditioned on the policy's chosen type/x at each step.
         """
-        h = self.encode(batch)
-        h_pre = h[:, 0::2]
+        was_training = self.training
+        self.eval()
+        try:
+            h = self.encode(batch)
+            h_pre = h[:, 0::2]
 
-        q_type_logits = self._q_type_logits(h_pre, batch.arsenal_per_type, batch.batter_per_type)
-        if repertoire_mask is not None:
-            q_type_logits = q_type_logits.masked_fill(~repertoire_mask, float("-inf"))
-        chosen_type = q_type_logits.argmax(dim=-1)               # (B, T)
+            q_type_logits = self._q_type_logits(h_pre, batch.arsenal_per_type, batch.batter_per_type)
+            if repertoire_mask is not None:
+                q_type_logits = q_type_logits.masked_fill(~repertoire_mask, float("-inf"))
+            chosen_type = q_type_logits.argmax(dim=-1)               # (B, T)
 
-        e_pt = self.emb_pitch_type_action(chosen_type)
-        ars_chosen = self.arsenal_norm(self._gather_per_type_features(batch.arsenal_per_type, chosen_type))
-        bpt_chosen = self.batter_pt_norm(self._gather_per_type_features(batch.batter_per_type, chosen_type))
-        q_x_logits = self.q_head_x(torch.cat([h_pre, e_pt, ars_chosen, bpt_chosen], dim=-1))
-        chosen_x = q_x_logits.argmax(dim=-1)
+            e_pt = self.emb_pitch_type_action(chosen_type)
+            ars_chosen = self.arsenal_norm(self._gather_per_type_features(batch.arsenal_per_type, chosen_type))
+            bpt_chosen = self.batter_pt_norm(self._gather_per_type_features(batch.batter_per_type, chosen_type))
+            q_x_logits = self.q_head_x(torch.cat([h_pre, e_pt, ars_chosen, bpt_chosen], dim=-1))
+            chosen_x = q_x_logits.argmax(dim=-1)
 
-        e_x = self.emb_x_bin_action(chosen_x)
-        q_z_logits = self.q_head_z(torch.cat([h_pre, e_pt, e_x, ars_chosen, bpt_chosen], dim=-1))
-        chosen_z = q_z_logits.argmax(dim=-1)
+            e_x = self.emb_x_bin_action(chosen_x)
+            q_z_logits = self.q_head_z(torch.cat([h_pre, e_pt, e_x, ars_chosen, bpt_chosen], dim=-1))
+            chosen_z = q_z_logits.argmax(dim=-1)
 
-        out = {
-            "pitch_type": chosen_type,
-            "x_bin": chosen_x,
-            "z_bin": chosen_z,
-            "valid_mask": batch.valid_mask,
-        }
-        if return_logits:
-            out["q_type_logits"] = q_type_logits
-            out["q_x_logits"] = q_x_logits
-            out["q_z_logits"] = q_z_logits
-        return out
+            out = {
+                "pitch_type": chosen_type,
+                "x_bin": chosen_x,
+                "z_bin": chosen_z,
+                "valid_mask": batch.valid_mask,
+            }
+            if return_logits:
+                out["q_type_logits"] = q_type_logits
+                out["q_x_logits"] = q_x_logits
+                out["q_z_logits"] = q_z_logits
+            return out
+        finally:
+            if was_training:
+                self.train()
 
 
 # --------------------------------------------------------------------------- #
@@ -439,6 +452,31 @@ def shift_v_for_next_state(
 # --------------------------------------------------------------------------- #
 # Repertoire mask helper
 # --------------------------------------------------------------------------- #
+
+
+def repertoire_mask_from_batch(batch: PABatch, n_min: int) -> torch.Tensor | None:
+    """Vectorized repertoire mask derived from per-batch arsenal lookup.
+
+    If ``n_min <= 0``, returns ``None`` (no mask — caller should skip masking).
+    Otherwise returns ``(B, T, n_pitch_types)`` bool mask: True where the
+    ``(pitcher, type)`` count is at least ``n_min``. Pitchers with NO
+    in-repertoire types (e.g., UNK pitcher_id=0, OOV) get all-True fallback so
+    they're not blocked from acting entirely.
+
+    Convention: ``n_min == 0`` (default for FQE/behavioral) → mask disabled.
+    Set on CLI / config to opt in. The mask was deliberately made a
+    hyperparameter rather than always-on because (a) arsenal counts are noisy
+    for low-sample pitchers, (b) IQL's expectile-V is the soft conservatism
+    mechanism, (c) the pitcher embedding subsumes the same information
+    conceptually. IQL training is unaffected by this knob — the mask only ever
+    fires at inference (and indirectly in FQE's policy-bootstrap step).
+    """
+    if n_min <= 0:
+        return None
+    counts = batch.arsenal_per_type[..., 0]                 # ARSENAL_HEAD_FIELDS[0] = 'count'
+    repertoire = (counts >= n_min)                          # (B, T, n_pitch_types) bool
+    no_allowed = ~repertoire.any(dim=-1, keepdim=True)      # (B, T, 1)
+    return repertoire | no_allowed.expand_as(repertoire)
 
 
 def build_repertoire_mask(

@@ -18,6 +18,7 @@ from src.qtransformer import (
     build_repertoire_mask,
     expectile_loss,
     iql_losses,
+    repertoire_mask_from_batch,
     shift_v_for_next_state,
 )
 
@@ -190,3 +191,86 @@ def test_policy_returns_indices_within_action_vocab():
     assert (out["pitch_type"] >= 0).all() and (out["pitch_type"] < VOCAB_SIZES["pitch_type"]).all()
     assert (out["x_bin"] >= 0).all() and (out["x_bin"] < N_X).all()
     assert (out["z_bin"] >= 0).all() and (out["z_bin"] < N_Z).all()
+
+
+# --------------------------------------------------------------------------- #
+# Repertoire mask + policy() eval mode tests (added in batched audit fix)
+# --------------------------------------------------------------------------- #
+
+
+def test_repertoire_mask_from_batch_returns_none_when_disabled():
+    """n_min <= 0 means the mask is disabled — must return None, not a tensor."""
+    batch = _make_batch()
+    assert repertoire_mask_from_batch(batch, n_min=0) is None
+    assert repertoire_mask_from_batch(batch, n_min=-1) is None
+
+
+def test_repertoire_mask_from_batch_correctness():
+    """For n_min > 0: mask is True where count >= n_min; pitchers with no
+    in-repertoire types get all-True fallback."""
+    B, T, n_pt = 2, 3, VOCAB_SIZES["pitch_type"]
+    arsenal = torch.zeros(B, T, n_pt, 14)
+    # Pitcher 0: counts = [10, 0, 0, 100, 0, 0]  → with n_min=5, allowed = [True, F, F, True, F, F]
+    arsenal[0, :, 0, 0] = 10
+    arsenal[0, :, 3, 0] = 100
+    # Pitcher 1: all counts = 0  → no in-repertoire → all-True fallback
+    # arsenal[1] stays at zeros
+    pre_cat = {f: torch.zeros(B, T, dtype=torch.int64) for f in PRE_ACTION_CATEGORICAL_FIELDS}
+    batch = PABatch(
+        pre_cat=pre_cat,
+        pre_cont=torch.zeros(B, T, len(PRE_ACTION_CONTINUOUS_FIELDS)),
+        profile=torch.zeros(B, T, len(BATTER_PROFILE_OVERALL_FIELDS)),
+        post_cat={f: torch.zeros(B, T, dtype=torch.int64) for f in POST_ACTION_CATEGORICAL_FIELDS},
+        post_cont=torch.zeros(B, T, len(POST_ACTION_CONTINUOUS_FIELDS)),
+        reward=torch.zeros(B, T),
+        is_terminal=torch.zeros(B, T, dtype=torch.bool),
+        pa_lengths=torch.tensor([T, T], dtype=torch.int64),
+        valid_mask=torch.ones(B, T, dtype=torch.bool),
+        arsenal_per_type=arsenal,
+        batter_per_type=torch.zeros(B, T, n_pt, 4),
+    )
+    mask = repertoire_mask_from_batch(batch, n_min=5)
+    assert mask is not None
+    assert mask.shape == (B, T, n_pt)
+    # Pitcher 0: only types 0 and 3 allowed
+    assert mask[0, 0].tolist() == [True, False, False, True, False, False]
+    # Pitcher 1: all-True fallback (no in-repertoire types)
+    assert mask[1, 0].all().item()
+
+
+def test_policy_restores_train_mode_after_call():
+    """policy() should leave the model in whatever mode it was in before the call."""
+    cfg = QTransformerConfig(d_model=32, n_layers=2, n_heads=4, d_ff=64,
+                             n_x_bins=N_X, n_z_bins=N_Z)
+    model = QTransformer(VOCAB_SIZES, cfg=cfg, encoder_cfg=EncoderConfig(d_model=32, d_player_emb=8))
+    batch = _make_batch(B=2, T=3)
+
+    model.train()
+    assert model.training is True
+    model.policy(batch)
+    assert model.training is True, "policy() should restore train mode after exit"
+
+    model.eval()
+    assert model.training is False
+    model.policy(batch)
+    assert model.training is False, "policy() should leave eval mode unchanged"
+
+
+def test_policy_runs_in_eval_mode():
+    """policy() should be deterministic across calls even when caller forgot to
+    call model.eval(). High dropout makes the difference observable."""
+    cfg = QTransformerConfig(d_model=32, n_layers=2, n_heads=4, d_ff=64,
+                             dropout=0.5,  # high dropout — would diverge under train mode
+                             n_x_bins=N_X, n_z_bins=N_Z)
+    model = QTransformer(
+        VOCAB_SIZES, cfg=cfg,
+        encoder_cfg=EncoderConfig(d_model=32, d_player_emb=8, dropout=0.5),
+    )
+    model.train()  # caller forgot eval()
+    batch = _make_batch(B=2, T=3)
+    out1 = model.policy(batch)
+    out2 = model.policy(batch)
+    # Argmax actions must match — dropout was internally disabled by policy()
+    assert torch.equal(out1["pitch_type"], out2["pitch_type"])
+    assert torch.equal(out1["x_bin"], out2["x_bin"])
+    assert torch.equal(out1["z_bin"], out2["z_bin"])

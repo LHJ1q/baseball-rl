@@ -395,20 +395,22 @@ def compute_feature_stats(
     Booleans (``on_1b/2b/3b``, ``low_sample`` flags) are kept in the stats so they get
     centered too, but the encoder can also leave them raw — both work.
     """
-    pre_cont_fields = [
-        "balls", "strikes", "outs_when_up", "inning",
-        "n_thruorder_pitcher", "pitch_idx_in_pa",
-        "score_diff", "sz_top", "sz_bot",
-        "on_1b", "on_2b", "on_3b",
-    ]
-    post_cont_fields = [
-        "plate_x_mirrored", "plate_z",
-        "reward_pitcher", "is_terminal",
-    ]
+    # Single source of truth: import the field lists from src.encoder so any
+    # future change there propagates here automatically (was previously a
+    # silent drift risk).
+    from src.encoder import (
+        BATTER_PROFILE_OVERALL_FIELDS,
+        POST_ACTION_CONTINUOUS_FIELDS,
+        PRE_ACTION_CONTINUOUS_FIELDS,
+    )
+    pre_cont_fields = list(PRE_ACTION_CONTINUOUS_FIELDS)
+    post_cont_fields = list(POST_ACTION_CONTINUOUS_FIELDS)
+    # The encoder names the batter low-sample flag 'batter_low_sample' but the
+    # raw profile column is 'low_sample'. Map the encoder fields onto the
+    # source column names for stat computation.
     profile_overall_fields = [
-        "pa_count", "k_rate", "bb_rate", "xwoba_mean",
-        "swing_rate", "whiff_rate", "contact_rate", "chase_rate",
-        "low_sample",
+        ("low_sample" if f == "batter_low_sample" else f)
+        for f in BATTER_PROFILE_OVERALL_FIELDS
     ]
 
     train = train_tokens.copy()

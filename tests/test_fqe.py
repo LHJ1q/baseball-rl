@@ -192,3 +192,66 @@ def test_fqe_policy_model_remains_frozen():
 
     for n, p in policy.named_parameters():
         assert torch.equal(p.data, snapshot[n]), f"policy parameter {n} changed during FQE training"
+
+
+# --------------------------------------------------------------------------- #
+# Repertoire mask hyperparameter (default OFF)
+# --------------------------------------------------------------------------- #
+
+
+def test_fqe_loss_passes_no_mask_by_default():
+    """With repertoire_mask_min_count=0 (default), policy_model.policy should
+    be called WITHOUT a mask (None). Captured via monkey-patch."""
+    from src.qtransformer import QTransformer as _QT
+    fqe = _tiny_model()
+    policy = _tiny_model()
+    for p in policy.parameters():
+        p.requires_grad_(False)
+    batch = _make_batch()
+
+    captured = {}
+    original_policy = _QT.policy
+    def _spy(self, batch, repertoire_mask=None, return_logits=False):
+        captured["mask"] = repertoire_mask
+        return original_policy(self, batch, repertoire_mask=repertoire_mask, return_logits=return_logits)
+    _QT.policy = _spy
+    try:
+        fqe_loss(fqe, policy, batch, gamma=1.0)  # default repertoire_mask_min_count=0
+    finally:
+        _QT.policy = original_policy
+    assert captured["mask"] is None, f"expected None mask by default, got {type(captured['mask'])}"
+
+
+def test_fqe_loss_passes_mask_when_enabled():
+    """With repertoire_mask_min_count > 0, policy_model.policy should be called
+    with a (B, T, n_pitch_types) bool tensor."""
+    from src.qtransformer import QTransformer as _QT
+    fqe = _tiny_model()
+    policy = _tiny_model()
+    for p in policy.parameters():
+        p.requires_grad_(False)
+    batch = _make_batch()
+    # Set non-trivial arsenal counts so the mask isn't trivial
+    batch.arsenal_per_type[..., 0] = 100  # all types past threshold
+
+    captured = {}
+    original_policy = _QT.policy
+    def _spy(self, batch, repertoire_mask=None, return_logits=False):
+        captured["mask"] = repertoire_mask
+        return original_policy(self, batch, repertoire_mask=repertoire_mask, return_logits=return_logits)
+    _QT.policy = _spy
+    try:
+        fqe_loss(fqe, policy, batch, gamma=1.0, repertoire_mask_min_count=10)
+    finally:
+        _QT.policy = original_policy
+    assert captured["mask"] is not None, "mask should be passed when min_count > 0"
+    assert captured["mask"].dtype == torch.bool
+    n_pt = VOCAB_SIZES["pitch_type"]
+    assert captured["mask"].shape == (batch.valid_mask.shape[0], batch.valid_mask.shape[1], n_pt)
+
+
+def test_fqe_trainer_config_default_mask_disabled():
+    """Default config must have mask disabled — locks in the design choice."""
+    cfg = FQETrainerConfig()
+    assert cfg.repertoire_mask_min_count == 0, \
+        "default repertoire_mask_min_count must be 0 (disabled); see CLAUDE.md design rationale"

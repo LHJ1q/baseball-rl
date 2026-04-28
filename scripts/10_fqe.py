@@ -61,6 +61,11 @@ def main() -> None:
                         help="Tiny dataset slice + 2 epochs; validates the loop end-to-end on Macbook.")
     parser.add_argument("--no-init-from-policy", action="store_true",
                         help="Don't initialize FQE weights from the policy checkpoint (start fresh).")
+    parser.add_argument(
+        "--repertoire-mask-min-count", type=int, default=0,
+        help="If >0, FQE evaluates π_learned constrained to per-pitcher repertoire types with "
+             "count >= N. Default 0 = mask disabled (matches default deployment policy).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -88,6 +93,7 @@ def main() -> None:
     overrides = {
         "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
         "num_workers": args.num_workers, "gamma": args.gamma, "seed": args.seed,
+        "repertoire_mask_min_count": args.repertoire_mask_min_count,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -156,8 +162,14 @@ def main() -> None:
                             num_workers=fqe_cfg.num_workers, collate_fn=pa_collate)
     test_loader = DataLoader(test_ds, batch_size=fqe_cfg.batch_size, shuffle=False,
                              num_workers=fqe_cfg.num_workers, collate_fn=pa_collate)
-    val_v = estimate_pa_values(fqe_model, policy_model, val_loader, device=device)
-    test_v = estimate_pa_values(fqe_model, policy_model, test_loader, device=device)
+    val_v = estimate_pa_values(
+        fqe_model, policy_model, val_loader, device=device,
+        repertoire_mask_min_count=args.repertoire_mask_min_count,
+    )
+    test_v = estimate_pa_values(
+        fqe_model, policy_model, test_loader, device=device,
+        repertoire_mask_min_count=args.repertoire_mask_min_count,
+    )
 
     print("=" * 70)
     print("FQE per-PA value estimates")

@@ -167,3 +167,28 @@ def test_trainer_metrics_csv_is_written():
         content = metrics_file.read_text()
         assert "q_loss" in content
         assert "phase" in content
+
+
+# --------------------------------------------------------------------------- #
+# Runtime is_terminal invariant assertion in Trainer.step
+# --------------------------------------------------------------------------- #
+
+
+def test_trainer_step_asserts_is_terminal_invariant():
+    """Trainer.step must reject batches where any PA has != 1 terminal pitches.
+    The invariant is load-bearing for shift_v_for_next_state's zero pad."""
+    import pytest as _pytest
+    model = _tiny_model()
+    train_ds = _SyntheticPADataset(n_items=8)
+    val_ds = _SyntheticPADataset(n_items=4)
+    cfg = TrainerConfig(
+        lr=1e-3, warmup_steps=2, batch_size=4, num_workers=0,
+        epochs=1, bf16=False, pin_memory=False, include_pitcher_blind_eval=False,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        trainer = Trainer(model, train_ds, val_ds, cfg, torch.device("cpu"), Path(tmp))
+        bad_batch = next(iter(trainer.train_loader))
+        # Corrupt the batch: zero out is_terminal so no PA has a terminal pitch.
+        bad_batch.is_terminal.zero_()
+        with _pytest.raises(AssertionError, match="is_terminal invariant violated"):
+            trainer.step(bad_batch)
