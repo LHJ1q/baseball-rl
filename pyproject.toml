@@ -13,7 +13,7 @@ dependencies = [
     "numpy==2.2.6",
     "pybaseball==2.2.7",
     "tqdm==4.67.3",
-    "torch>=2.5",
+    "torch>=2.7",   # >=2.7 for native Blackwell (sm_120) support; A100 / Ampere works on 2.7 too.
 ]
 
 [project.optional-dependencies]

@@ -26,12 +26,36 @@ Offline reinforcement learning for MLB pitch selection. A **Q-Transformer** trai
 
 The full filter + tokenize spec lives in `docs/FILTER_RULES.md` and `CLAUDE.md`. Read those before changing rules or extending seasons.
 
+## Setup
+
+```bash
+git clone https://github.com/LHJ1q/baseball-rl.git
+cd baseball-rl
+
+# Option A — conda (recommended; handles CUDA toolchain on GPU boxes)
+conda env create -f environment.yml
+conda activate baseball-rl
+pip install -e .       # editable install if you skipped the `-e .` line in environment.yml
+
+# Option B — pip + system Python (>= 3.10)
+pip install -e ".[dev]"
+```
+
+**GPU compatibility.** The trainer auto-detects CUDA / MPS / CPU and turns on
+BF16 autocast + `torch.compile` + TF32 only on CUDA. Verified GPU targets:
+
+| GPU | Arch | BF16 | FlashAttention (SDPA) | `torch.compile` | Notes |
+|---|---|---|---|---|---|
+| **RTX Pro 4500** | Blackwell (sm_120) | ✅ | ✅ | ✅ | Needs PyTorch ≥ 2.7 with cu128 wheels (the conda env file pins `pytorch-cuda=12.8`). |
+| **A100 40 GB / 80 GB** | Ampere (sm_80) | ✅ | ✅ | ✅ | Works on cu121 / cu124 / cu128. Drop `--batch-size` to 512 on the 40 GB card if VRAM tight. |
+| Macbook M-series | MPS | fp32 only | n/a | auto-skipped | Smoke tests + tiny `--smoke-train` only; not for full training. |
+| CPU | — | fp32 | n/a | auto-skipped | Smoke tests only. |
+
+Both production GPUs run the v1 preset comfortably at batch 512–1024 PAs. End-to-end wall-clock is dataloader-bound (~1–2 hours for 40 epochs) on either.
+
 ## Reproduce — five-season run (2021–2025)
 
 ```bash
-# Install (Python >= 3.10)
-pip install -e ".[dev]"
-
 # 1. Download all five seasons (~25 min cold; pybaseball cache enabled)
 for y in 2021 2022 2023 2024 2025; do python scripts/01_download.py --year $y; done
 
