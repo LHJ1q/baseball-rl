@@ -35,7 +35,9 @@ def eval_losses(model: QTransformer, batch: PABatch, gamma: float, tau: float) -
     out = model(batch)
     v_next = shift_v_for_next_state(out["v"], batch.valid_mask)
     losses = iql_losses(
-        q_chosen=out["q_chosen"],
+        q_type=out["q_type"],
+        q_x=out["q_x"],
+        q_z=out["q_z"],
         v_current=out["v"],
         v_next=v_next,
         reward=batch.reward,

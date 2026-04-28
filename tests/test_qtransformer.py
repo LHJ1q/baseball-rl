@@ -92,16 +92,20 @@ def test_expectile_loss_asymmetry():
 
 
 def test_iql_loss_terminal_drops_bootstrap():
-    """At a terminal pitch, target should equal reward (no γV(s')) regardless of v_next."""
+    """At a terminal pitch, target should equal reward (no γV(s')) regardless of v_next.
+    All three Q heads contribute equally (each is 0.25) so total q_loss = 0.75."""
     q = torch.tensor([[0.0]])
     v = torch.tensor([[0.0]])
     v_next = torch.tensor([[100.0]])  # huge — should be ignored
     r = torch.tensor([[0.5]])
     term = torch.tensor([[True]])
     mask = torch.tensor([[True]])
-    losses = iql_losses(q, v, v_next, r, term, mask, gamma=1.0, tau=0.7)
-    # target = r = 0.5, q = 0 → q_loss = 0.25
-    assert abs(losses["q_loss"].item() - 0.25) < 1e-6
+    losses = iql_losses(q_type=q, q_x=q, q_z=q,
+                       v_current=v, v_next=v_next, reward=r,
+                       is_terminal=term, valid_mask=mask, gamma=1.0, tau=0.7)
+    # Each head: target = r = 0.5, q = 0 → per-head loss = 0.25; sum = 0.75
+    assert abs(losses["q_loss"].item() - 0.75) < 1e-6
+    assert abs(losses["q_loss_z"].item() - 0.25) < 1e-6
 
 
 def test_shift_v_for_next_state_pads_last_with_zero():

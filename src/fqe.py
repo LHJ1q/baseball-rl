@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 
-def _gather_q_at_actions(
+def _gather_q_heads_at_actions(
     fqe_model: QTransformer,
     h_pre: torch.Tensor,                        # (B, T, d_model)
     arsenal_per_type: torch.Tensor,             # (B, T, n_pt, k_arsenal)
@@ -52,16 +52,14 @@ def _gather_q_at_actions(
     chosen_pitch_type: torch.Tensor,            # (B, T) int64
     chosen_x_bin: torch.Tensor,                 # (B, T) int64
     chosen_z_bin: torch.Tensor,                 # (B, T) int64
-) -> torch.Tensor:
-    """Evaluate fqe_model's Q heads at the given (state, action) tuples.
-
-    Returns the deepest head's Q value at the chosen indices: ``(B, T)``.
-    """
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Evaluate all three of fqe_model's Q heads at the given (state, action)
+    tuples. Returns ``(q_type, q_x, q_z)`` each of shape ``(B, T)``."""
     out = fqe_model.heads_chosen(
         h_pre, chosen_pitch_type, chosen_x_bin, chosen_z_bin,
         arsenal_per_type, batter_per_type,
     )
-    return out["q_chosen"]
+    return out["q_type"], out["q_x"], out["q_z"]
 
 
 def fqe_loss(
@@ -79,8 +77,8 @@ def fqe_loss(
     """
     h_fqe = fqe_model.encode(batch)[:, 0::2]                # (B, T, d_model)
 
-    # Q^π(s_t, a_t) at the actions the behavior policy actually took.
-    q_chosen = _gather_q_at_actions(
+    # Q^π(s_t, a_t) at the actions the behavior policy actually took, at all three heads.
+    q_type, q_x, q_z = _gather_q_heads_at_actions(
         fqe_model, h_fqe,
         batch.arsenal_per_type, batch.batter_per_type,
         batch.post_cat["pitch_type_id"], batch.post_cat["x_bin"], batch.post_cat["z_bin"],
@@ -89,27 +87,34 @@ def fqe_loss(
     # π_learned's actions at every state (its argmax greedy policy).
     with torch.no_grad():
         policy_out = policy_model.policy(batch)
-        # Q^π(s_t, π_learned(s_t)) at every position, evaluated through the FQE model.
-        # We need this AT THE NEXT STATE — i.e., t+1 — for the TD target. We compute
-        # at every position then shift by one along the time axis below.
-        q_at_policy = _gather_q_at_actions(
+        # Q^π(s_t, π_learned(s_t)) — we use the deepest head as the canonical Q value
+        # for the TD target's bootstrap term.
+        _, _, q_z_at_policy = _gather_q_heads_at_actions(
             fqe_model, h_fqe,
             batch.arsenal_per_type, batch.batter_per_type,
             policy_out["pitch_type"], policy_out["x_bin"], policy_out["z_bin"],
         )
 
     # Shift left by one to get Q^π(s_{t+1}, π_learned(s_{t+1})).
-    q_next = torch.zeros_like(q_at_policy)
-    q_next[:, :-1] = q_at_policy[:, 1:].detach()
+    q_next = torch.zeros_like(q_z_at_policy)
+    q_next[:, :-1] = q_z_at_policy[:, 1:].detach()
     target = batch.reward + gamma * q_next * (~batch.is_terminal).float()
 
-    diff = q_chosen - target
-    loss_per = diff.pow(2)
     mask = batch.valid_mask.float()
     n = mask.sum().clamp_min(1.0)
+
+    # Train all three heads on the same TD target (parallel to IQL's iql_losses).
+    fqe_loss_type = (((q_type - target).pow(2)) * mask).sum() / n
+    fqe_loss_x = (((q_x - target).pow(2)) * mask).sum() / n
+    fqe_loss_z = (((q_z - target).pow(2)) * mask).sum() / n
+    total_fqe_loss = fqe_loss_type + fqe_loss_x + fqe_loss_z
+
     return {
-        "fqe_loss": (loss_per * mask).sum() / n,
-        "q_mean": (q_chosen * mask).sum() / n,
+        "fqe_loss": total_fqe_loss,
+        "fqe_loss_type": fqe_loss_type,
+        "fqe_loss_x": fqe_loss_x,
+        "fqe_loss_z": fqe_loss_z,
+        "q_mean": (q_z * mask).sum() / n,           # report q_z as the canonical Q
         "target_mean": (target * mask).sum() / n,
     }
 
@@ -377,7 +382,7 @@ def estimate_pa_values(
         batch = batch.to(device)
         h = fqe_model.encode(batch)[:, 0::2]
         policy_out = policy_model.policy(batch)
-        q_at_policy = _gather_q_at_actions(
+        _, _, q_at_policy = _gather_q_heads_at_actions(
             fqe_model, h,
             batch.arsenal_per_type, batch.batter_per_type,
             policy_out["pitch_type"], policy_out["x_bin"], policy_out["z_bin"],

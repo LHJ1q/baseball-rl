@@ -108,6 +108,11 @@ def check_causal_mask(model, batch) -> CheckResult:
 
     # h_pre at positions 0..last_t should be unchanged (they only see pre+post of
     # earlier pitches; perturbing pitch last_t's post should not affect them).
+    if last_t == 0:
+        return CheckResult(
+            "3. causal mask: earlier pre-positions unaffected by later post perturbation",
+            "WARN", "first PA has only 1 pitch — no earlier positions to compare; check skipped",
+        )
     diff_at_earlier = (out0["h_pre"][0, :last_t] - out1["h_pre"][0, :last_t]).abs().max()
     diff_at_last = (out0["h_pre"][0, last_t] - out1["h_pre"][0, last_t]).abs().max()
     ok = bool(diff_at_earlier.item() < 1e-5)
@@ -205,7 +210,7 @@ def check_iql_loss_finite(model, batch) -> CheckResult:
     out = model(batch)
     v_next = shift_v_for_next_state(out["v"], batch.valid_mask)
     losses = iql_losses(
-        q_chosen=out["q_chosen"],
+        q_type=out["q_type"], q_x=out["q_x"], q_z=out["q_z"],
         v_current=out["v"],
         v_next=v_next,
         reward=batch.reward,
@@ -230,8 +235,9 @@ def check_overfit_single_batch(model, batch, n_steps: int = 50) -> CheckResult:
         out = model(batch)
         v_next = shift_v_for_next_state(out["v"], batch.valid_mask)
         loss_dict = iql_losses(
-            out["q_chosen"], out["v"], v_next, batch.reward,
-            batch.is_terminal, batch.valid_mask,
+            q_type=out["q_type"], q_x=out["q_x"], q_z=out["q_z"],
+            v_current=out["v"], v_next=v_next, reward=batch.reward,
+            is_terminal=batch.is_terminal, valid_mask=batch.valid_mask,
         )
         total = loss_dict["q_loss"] + loss_dict["v_loss"]
         total.backward()

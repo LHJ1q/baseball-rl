@@ -348,7 +348,9 @@ def expectile_loss(diff: torch.Tensor, tau: float) -> torch.Tensor:
 
 
 def iql_losses(
-    q_chosen: torch.Tensor,        # (B, T) Q for the action actually taken
+    q_type: torch.Tensor,          # (B, T) chosen-type Q from q_head_type
+    q_x: torch.Tensor,             # (B, T) chosen-(type, x) Q from q_head_x
+    q_z: torch.Tensor,             # (B, T) chosen-(type, x, z) Q from q_head_z (deepest)
     v_current: torch.Tensor,       # (B, T) V at current state
     v_next: torch.Tensor,          # (B, T) V at next state (s_{t+1})
     reward: torch.Tensor,          # (B, T)
@@ -358,27 +360,41 @@ def iql_losses(
     gamma: float = 1.0,
     tau: float = 0.7,
 ) -> dict[str, torch.Tensor]:
-    """Returns ``{q_loss, v_loss}`` averaged over valid positions.
+    """Returns ``{q_loss, v_loss, q_loss_type, q_loss_x, q_loss_z}`` averaged
+    over valid positions.
+
+    All three autoregressive Q-heads must be trained — at inference the policy
+    argmaxes over each head in turn, so any untrained head yields random
+    behavior at that action axis. We train each head on the same TD target
+    (the chosen action's value), summing the three Q-losses.
 
     Q-loss: TD with V (no max over actions — IQL's key trick).
         target = r + γ · V(s') · (1 − terminal)
-        L_Q   = MSE(Q(s, a), target)
+        L_Q   = MSE(Q_type, target) + MSE(Q_x, target) + MSE(Q_z, target)
 
     V-loss: expectile regression of Q under the data distribution.
-        L_V   = expectile_loss(Q(s, a) − V(s), tau)
+        L_V   = expectile_loss(Q_z(s, a) − V(s), tau)
+
+    V is bootstrapped from the deepest head Q_z (most-refined estimate).
     """
     target = reward + gamma * v_next * (~is_terminal).float()
-    q_err = q_chosen - target
-    q_loss_per = q_err.pow(2)
-
-    v_diff = q_chosen.detach() - v_current
-    v_loss_per = expectile_loss(v_diff, tau)
-
     mask = valid_mask.float()
     n = mask.sum().clamp_min(1.0)
+
+    q_loss_type = (((q_type - target).pow(2)) * mask).sum() / n
+    q_loss_x = (((q_x - target).pow(2)) * mask).sum() / n
+    q_loss_z = (((q_z - target).pow(2)) * mask).sum() / n
+    q_loss = q_loss_type + q_loss_x + q_loss_z
+
+    v_diff = q_z.detach() - v_current
+    v_loss = (expectile_loss(v_diff, tau) * mask).sum() / n
+
     return {
-        "q_loss": (q_loss_per * mask).sum() / n,
-        "v_loss": (v_loss_per * mask).sum() / n,
+        "q_loss": q_loss,
+        "v_loss": v_loss,
+        "q_loss_type": q_loss_type,
+        "q_loss_x": q_loss_x,
+        "q_loss_z": q_loss_z,
     }
 
 
