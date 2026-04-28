@@ -166,7 +166,8 @@ class FQETrainerConfig:
     # Cosine LR floor (matches TrainerConfig)
     min_lr_factor: float = 0.1
 
-    # torch.compile on CUDA (auto-skipped on MPS/CPU). Compiles fqe_model only;
+    # torch.compile on CUDA (auto-skipped on MPS/CPU). Compiles fqe_model.encode
+    # and .heads_chosen — the methods fqe_loss / estimate_pa_values invoke.
     # policy_model stays uncompiled to keep the IQL-checkpoint load path simple.
     compile: bool = True
 
@@ -241,11 +242,19 @@ class FQETrainer:
             lr=cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay,
         )
 
-        # torch.compile on fqe_model only (policy_model stays uncompiled — see
-        # docstring rationale). Must come AFTER optimizer creation.
+        # torch.compile applied to the methods fqe_loss and estimate_pa_values
+        # actually invoke — `.encode(batch)` and `.heads_chosen(...)`. We do NOT
+        # compile fqe_model.__call__ (the forward path) because fqe_loss never
+        # calls it: it composes encode + heads_chosen at chosen actions and
+        # again at policy actions. Wrapping fqe_model itself would route only
+        # the unused forward through the compiler, giving zero speedup. Method-
+        # level compile is the equivalent path.
+        # policy_model stays uncompiled — it's frozen and called only via
+        # .policy(), keeping the IQL-checkpoint state_dict load path simple.
         if cfg.compile and self.device.type == "cuda":
-            self.fqe_model = torch.compile(self.fqe_model, dynamic=True)
-            logger.info("torch.compile(fqe_model, dynamic=True) applied (CUDA)")
+            self.fqe_model.encode = torch.compile(self.fqe_model.encode, dynamic=True)
+            self.fqe_model.heads_chosen = torch.compile(self.fqe_model.heads_chosen, dynamic=True)
+            logger.info("torch.compile applied to fqe_model.encode + .heads_chosen (CUDA)")
 
         self._use_bf16 = cfg.bf16 and self.device.type == "cuda"
 
@@ -359,7 +368,10 @@ class FQETrainer:
     # --------------------------------------------------------------------- #
 
     def save_checkpoint(self, path: Path) -> None:
-        # Unwrap if torch.compile wrapped fqe_model.
+        # Method-level compile wraps fqe_model.encode / .heads_chosen, NOT
+        # fqe_model itself, so state_dict() already has clean keys. The unwrap
+        # is a defensive no-op kept for forward-compat in case the wrap shape
+        # changes; getattr falls through to fqe_model when _orig_mod is absent.
         underlying = getattr(self.fqe_model, "_orig_mod", self.fqe_model)
         torch.save(
             {
