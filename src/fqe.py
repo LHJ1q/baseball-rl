@@ -249,12 +249,24 @@ class FQETrainer:
         # again at policy actions. Wrapping fqe_model itself would route only
         # the unused forward through the compiler, giving zero speedup. Method-
         # level compile is the equivalent path.
-        # policy_model stays uncompiled — it's frozen and called only via
-        # .policy(), keeping the IQL-checkpoint state_dict load path simple.
+        #
+        # Also compile policy_model.encode: fqe_loss calls policy_model.policy(batch)
+        # once per batch, and policy() runs the full transformer encoder via
+        # self.encode(batch). That's the second of two heavy encoder forwards
+        # per FQE batch — the first being fqe_model.encode above. Method-level
+        # compile is safe here even though policy_model is loaded from an IQL
+        # checkpoint: setting policy_model.encode as an instance attribute
+        # shadows the bound method but does NOT alter state_dict() keys (no
+        # _orig_mod. prefix), so the load path in scripts/10_fqe.py stays clean.
+        # The original "keep load simple" rationale applied to model-level
+        # compile (which adds the prefix); method-level sidesteps it entirely.
         if cfg.compile and self.device.type == "cuda":
             self.fqe_model.encode = torch.compile(self.fqe_model.encode, dynamic=True)
             self.fqe_model.heads_chosen = torch.compile(self.fqe_model.heads_chosen, dynamic=True)
-            logger.info("torch.compile applied to fqe_model.encode + .heads_chosen (CUDA)")
+            self.policy_model.encode = torch.compile(self.policy_model.encode, dynamic=True)
+            logger.info(
+                "torch.compile applied to fqe_model.encode + .heads_chosen and policy_model.encode (CUDA)"
+            )
 
         self._use_bf16 = cfg.bf16 and self.device.type == "cuda"
 
