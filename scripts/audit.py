@@ -576,6 +576,158 @@ def check_predict_batch_dtypes() -> CheckResult:
     )
 
 
+def check_arsenal_lookup_matches_parquet() -> CheckResult:
+    """The dataset's dense ``_arsenal_lookup[pitcher, type]`` must match the
+    raw values in pitcher_arsenal.parquet. A drift here would mean every
+    arsenal feature the model sees is wrong."""
+    if not (TOKENS_DIR / "pitcher_arsenal.parquet").exists():
+        return CheckResult("18. arsenal lookup table matches pitcher_arsenal.parquet",
+                           "WARN", "skipped — data/tokens/ not populated")
+    import pandas as pd
+    arsenal = pd.read_parquet(TOKENS_DIR / "pitcher_arsenal.parquet", engine="pyarrow")
+    vocab_sizes = load_vocab_sizes(TOKENS_DIR / "vocab.json")
+    ds = PitchPADataset(
+        TOKENS_DIR / "train.parquet",
+        TOKENS_DIR / "batter_profile.parquet",
+        pitcher_arsenal_path=TOKENS_DIR / "pitcher_arsenal.parquet",
+        n_pitch_types=vocab_sizes["pitch_type"],
+    )
+    # Spot-check 5 random rows from arsenal.parquet against the lookup table
+    as_arr = arsenal.sample(n=min(5, len(arsenal)), random_state=0)
+    bad = []
+    for _, row in as_arr.iterrows():
+        pid, ptype = int(row["pitcher_id"]), int(row["pitch_type_id"])
+        for i, fname in enumerate(ARSENAL_HEAD_FIELDS):
+            expected = float(row[fname])
+            actual = float(ds._arsenal_lookup[pid, ptype, i])
+            if abs(expected - actual) > 1e-3:
+                bad.append(f"({pid}, {ptype}).{fname}: parquet={expected:.4f} lookup={actual:.4f}")
+    return CheckResult(
+        "18. arsenal lookup table matches pitcher_arsenal.parquet",
+        "PASS" if not bad else "FAIL",
+        f"spot-checked 5 (pitcher, pitch_type) rows × {len(ARSENAL_HEAD_FIELDS)} fields",
+        detail="" if not bad else "; ".join(bad[:5]),
+    )
+
+
+def check_x_bin_matches_digitization() -> CheckResult:
+    """Token x_bin must match np.digitize(plate_x_mirrored) using the saved
+    bin edges. A drift would mean the discretized action doesn't match where
+    the pitch actually went."""
+    if not (TOKENS_DIR / "vocab.json").exists():
+        return CheckResult("19. x_bin and z_bin match documented bin-edge digitization",
+                           "WARN", "skipped — data/tokens/ not populated")
+    import json, numpy as np
+    import pandas as pd
+    df = pd.read_parquet(TOKENS_DIR / "train.parquet", engine="pyarrow")
+    sample = df.sample(n=min(1000, len(df)), random_state=0)
+    vocab = json.loads((TOKENS_DIR / "vocab.json").read_text())
+    x_edges = np.array(vocab["x_bin_edges"])
+    z_edges = np.array(vocab["z_bin_edges"])
+    # Recompute bins from continuous values
+    x_lo, x_hi, n_x = float(x_edges[0]), float(x_edges[-1]), len(x_edges) - 1
+    z_lo, z_hi, n_z = float(z_edges[0]), float(z_edges[-1]), len(z_edges) - 1
+    px = sample["plate_x_mirrored"].to_numpy()
+    pz = sample["plate_z"].to_numpy()
+    px_clip = np.clip(px, x_lo, x_hi)
+    pz_clip = np.clip(pz, z_lo, z_hi)
+    expected_x = np.minimum(((px_clip - x_lo) / ((x_hi - x_lo) / n_x)).astype(np.int32), n_x - 1)
+    expected_z = np.minimum(((pz_clip - z_lo) / ((z_hi - z_lo) / n_z)).astype(np.int32), n_z - 1)
+    bad_x = int((expected_x != sample["x_bin"].to_numpy()).sum())
+    bad_z = int((expected_z != sample["z_bin"].to_numpy()).sum())
+    return CheckResult(
+        "19. x_bin and z_bin match documented bin-edge digitization",
+        "PASS" if (bad_x + bad_z) == 0 else "FAIL",
+        f"sampled 1000 rows: x mismatches={bad_x}, z mismatches={bad_z}",
+    )
+
+
+def check_pa_ordering_within_token_files() -> CheckResult:
+    """Within each PA, rows in the token file must be ordered by pitch_idx_in_pa
+    starting from 0 — required by the dataloader's sequence assembly."""
+    if not (TOKENS_DIR / "train.parquet").exists():
+        return CheckResult("20. PA rows in token file ordered by pitch_idx_in_pa",
+                           "WARN", "skipped — data/tokens/ not populated")
+    import pandas as pd
+    df = pd.read_parquet(TOKENS_DIR / "val.parquet", engine="pyarrow",
+                          columns=["game_pk", "at_bat_number", "pitch_idx_in_pa"])
+    # Check 100 random PAs
+    sample_pas = df[["game_pk", "at_bat_number"]].drop_duplicates().sample(
+        n=min(100, df[["game_pk", "at_bat_number"]].drop_duplicates().shape[0]),
+        random_state=0,
+    )
+    bad = 0
+    for _, row in sample_pas.iterrows():
+        pa = df[(df["game_pk"] == row["game_pk"]) & (df["at_bat_number"] == row["at_bat_number"])]
+        idxs = pa["pitch_idx_in_pa"].to_numpy()
+        if not (idxs == list(range(len(idxs)))).all():
+            bad += 1
+    return CheckResult(
+        "20. PA rows in token file ordered by pitch_idx_in_pa",
+        "PASS" if bad == 0 else "FAIL",
+        f"sampled 100 PAs from val: {bad} with bad ordering",
+    )
+
+
+def check_is_terminal_aligns_with_events() -> CheckResult:
+    """Every pitch with is_terminal=True must have non-null events in the
+    pre-token data (filter guarantee). Token files don't carry events; we
+    spot-check this against the processed parquet which does."""
+    proc_path = REPO_ROOT / "data" / "processed" / "statcast_2024.parquet"
+    if not proc_path.exists():
+        return CheckResult("21. is_terminal == events.notna() invariant in processed data",
+                           "WARN", "skipped — data/processed/statcast_2024.parquet not present")
+    import pandas as pd
+    df = pd.read_parquet(proc_path, engine="pyarrow", columns=["is_terminal", "events"])
+    sample = df.sample(n=min(10000, len(df)), random_state=0)
+    bad = int((sample["is_terminal"] != sample["events"].notna()).sum())
+    return CheckResult(
+        "21. is_terminal == events.notna() invariant in processed data",
+        "PASS" if bad == 0 else "FAIL",
+        f"sampled 10K rows: {bad} mismatches",
+    )
+
+
+def check_strike_zone_invariant() -> CheckResult:
+    """sz_top must be greater than sz_bot for every pitch (strike zone
+    geometry sanity)."""
+    if not (TOKENS_DIR / "train.parquet").exists():
+        return CheckResult("22. sz_top > sz_bot strike-zone invariant",
+                           "WARN", "skipped — data/tokens/ not populated")
+    import pandas as pd
+    df = pd.read_parquet(TOKENS_DIR / "train.parquet", engine="pyarrow",
+                          columns=["sz_top", "sz_bot"])
+    bad = int((df["sz_top"] <= df["sz_bot"]).sum())
+    return CheckResult(
+        "22. sz_top > sz_bot strike-zone invariant",
+        "PASS" if bad == 0 else "FAIL",
+        f"{bad} / {len(df):,} rows violate sz_top > sz_bot",
+    )
+
+
+def check_per_pa_reward_preserved_through_pipeline() -> CheckResult:
+    """Sum of reward_pitcher per PA should be identical between processed/
+    splits/tokens (no rounding drift > FP32 precision). Catches accidental
+    re-computation of reward at any phase."""
+    if not (TOKENS_DIR / "train.parquet").exists():
+        return CheckResult("23. per-PA reward sum preserved processed → tokens",
+                           "WARN", "skipped — data/tokens/ not populated")
+    import pandas as pd
+    splits = pd.read_parquet(REPO_ROOT / "data" / "splits" / "train.parquet",
+                              engine="pyarrow", columns=["game_pk", "at_bat_number", "reward_pitcher"])
+    tokens = pd.read_parquet(TOKENS_DIR / "train.parquet", engine="pyarrow",
+                              columns=["game_pk", "at_bat_number", "reward_pitcher"])
+    s_sum = splits.groupby(["game_pk", "at_bat_number"])["reward_pitcher"].sum()
+    t_sum = tokens.groupby(["game_pk", "at_bat_number"])["reward_pitcher"].sum()
+    joined = s_sum.to_frame("split").join(t_sum.to_frame("token"), how="outer")
+    max_diff = float((joined["split"] - joined["token"]).abs().max())
+    return CheckResult(
+        "23. per-PA reward sum preserved processed → tokens",
+        "PASS" if max_diff < 1e-3 else "FAIL",
+        f"max |Δ| = {max_diff:.2e} across {len(joined):,} PAs",
+    )
+
+
 def check_repertoire_mask_default_is_disabled() -> CheckResult:
     """Lock in the design choice that the repertoire mask defaults to OFF.
     Future regressions that flip the default would fail this check immediately."""
@@ -666,6 +818,13 @@ def main() -> None:
         check_predict_batch_dtypes(),
         check_repertoire_mask_default_is_disabled(),
         check_param_count_invariant(),
+        # Real-data integrity checks (require disk artifacts; warn-skip if absent)
+        check_arsenal_lookup_matches_parquet(),
+        check_x_bin_matches_digitization(),
+        check_pa_ordering_within_token_files(),
+        check_is_terminal_aligns_with_events(),
+        check_strike_zone_invariant(),
+        check_per_pa_reward_preserved_through_pipeline(),
     ]
     print(format_report(results))
     if any(r.status == "FAIL" for r in results):

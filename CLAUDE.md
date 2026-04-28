@@ -310,6 +310,18 @@ What needs doing when ready:
 
 The `--scheme year_level` flag is the only actual code change required; defer until the 2021-2023 + 2025 raw data is pulled.
 
+### Future model improvements (deferred — architecture choices, document before deciding)
+
+These are real semantic gaps from the canonical Q-Transformer / IQL recipe that are deliberately punted to separate commits because each is an independent design choice with non-trivial implementation cost. Order them by likely impact on the v1 GPU run:
+
+- **EMA target Q-network** (~30 LOC). Standard IQL and the Q-Transformer paper both use a Polyak-averaged target Q for stability. We currently `.detach()` the same online network's outputs as targets — works but is a known recipe for instability on long training runs. **Most likely lever for training stability.** Add `target_qnet` as an EMA copy of the model with `τ_ema ≈ 0.005`; use it for `target_type`, `target_x`, and `v_next` in `iql_losses`. FQE follows the same pattern.
+
+- **MC-return lower bound on the deepest target** (~40 LOC + tokenize-time precomputation). Q-Transformer paper anchors `target_z = max(r + γV(s'), returns_to_go)` to prevent value underestimation. Requires precomputing `rtg = reverse_cumsum(reward_pitcher)` per PA at tokenize time and storing on each token row; then `target_z = torch.max(target_z, rtg)` in `iql_losses`. **Biggest value-underestimation lever.**
+
+- **CQL-lite penalty on x and z heads** (~60 LOC). The repertoire mask (when enabled) only filters `pitch_type`; the x_bin and z_bin heads still extrapolate Q upward on rare locations for a given pitcher. Add a soft penalty `α · log Σ_x exp(Q(s, type, x))` (and same for z) to suppress OOD-action Q. Closes the conservatism gap on non-type axes.
+
+None of these block training v1. Decide order based on what eval surfaces (e.g., if val q_loss diverges late → add EMA target first; if FQE's per-PA value seems systematically pessimistic → add MC bound first).
+
 ### Future tokenization improvements (deferred)
 
 Open follow-ups that didn't block phase 5 shipping but are worth doing before training scales beyond v1:
