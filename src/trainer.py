@@ -360,13 +360,21 @@ class Trainer:
         saved_epochs = saved_cfg.get("epochs")
         if saved_epochs is not None and saved_epochs != self.cfg.epochs:
             saved_total = self.steps_per_epoch * saved_epochs
+            # Use the SAVED min_lr_factor when reconstructing the old schedule
+            # (default 0.0 for pre-floor checkpoints which decayed to 0). The new
+            # schedule uses the live cfg.min_lr_factor. Without this, the warning
+            # silently uses the new floor (0.1) for both, masking the actual
+            # schedule change for users resuming from a pre-floor checkpoint.
+            old_min_lr = saved_cfg.get("min_lr_factor", 0.0)
             old_lr = cosine_warmup_lr(
                 self.global_step, base_lr=self.cfg.lr,
                 warmup_steps=self.cfg.warmup_steps, total_steps=saved_total,
+                min_lr_factor=old_min_lr,
             )
             new_lr = cosine_warmup_lr(
                 self.global_step, base_lr=self.cfg.lr,
                 warmup_steps=self.cfg.warmup_steps, total_steps=self.total_steps,
+                min_lr_factor=self.cfg.min_lr_factor,
             )
             logger.warning(
                 "EPOCHS MISMATCH ON RESUME: checkpoint trained with epochs=%d, "
