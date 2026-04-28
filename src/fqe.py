@@ -163,6 +163,13 @@ class FQETrainerConfig:
     bf16: bool = True
     seed: int = 0
 
+    # Cosine LR floor (matches TrainerConfig)
+    min_lr_factor: float = 0.1
+
+    # torch.compile on CUDA (auto-skipped on MPS/CPU). Compiles fqe_model only;
+    # policy_model stays uncompiled to keep the IQL-checkpoint load path simple.
+    compile: bool = True
+
     # Repertoire mask threshold (default 0 = mask disabled). Set > 0 to constrain
     # ``π_learned``'s argmax to pitch types this pitcher has thrown at least N times in train.
     # See src/qtransformer.py:repertoire_mask_from_batch for the rationale (default OFF).
@@ -194,6 +201,10 @@ class FQETrainer:
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
+        # TF32 for fp32 matmul corners (BF16 autocast covers the rest).
+        if self.device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+
         self.fqe_model.to(self.device)
         self.policy_model.to(self.device)
         # π_learned is FROZEN during FQE training.
@@ -205,17 +216,22 @@ class FQETrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(cfg.seed)
 
+        # Dataloader hot-path: persistent workers + prefetch (matches Trainer).
+        _persist = cfg.num_workers > 0
+        _prefetch = 4 if cfg.num_workers > 0 else None
         self.train_loader = DataLoader(
             train_ds, batch_size=cfg.batch_size, shuffle=True,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory and self.device.type == "cuda",
             collate_fn=pa_collate, drop_last=True,
+            persistent_workers=_persist, prefetch_factor=_prefetch,
         )
         self.val_loader = DataLoader(
             val_ds, batch_size=cfg.batch_size, shuffle=False,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory and self.device.type == "cuda",
             collate_fn=pa_collate,
+            persistent_workers=_persist, prefetch_factor=_prefetch,
         )
         self.steps_per_epoch = max(1, len(self.train_loader))
         self.total_steps = self.steps_per_epoch * cfg.epochs
@@ -224,6 +240,12 @@ class FQETrainer:
             self.fqe_model.parameters(),
             lr=cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay,
         )
+
+        # torch.compile on fqe_model only (policy_model stays uncompiled — see
+        # docstring rationale). Must come AFTER optimizer creation.
+        if cfg.compile and self.device.type == "cuda":
+            self.fqe_model = torch.compile(self.fqe_model, dynamic=True)
+            logger.info("torch.compile(fqe_model, dynamic=True) applied (CUDA)")
 
         self._use_bf16 = cfg.bf16 and self.device.type == "cuda"
 
@@ -269,6 +291,7 @@ class FQETrainer:
             base_lr=self.cfg.lr,
             warmup_steps=self.cfg.warmup_steps,
             total_steps=self.total_steps,
+            min_lr_factor=self.cfg.min_lr_factor,
         )
         for g in self.optimizer.param_groups:
             g["lr"] = lr
@@ -336,9 +359,11 @@ class FQETrainer:
     # --------------------------------------------------------------------- #
 
     def save_checkpoint(self, path: Path) -> None:
+        # Unwrap if torch.compile wrapped fqe_model.
+        underlying = getattr(self.fqe_model, "_orig_mod", self.fqe_model)
         torch.save(
             {
-                "model": self.fqe_model.state_dict(),
+                "model": underlying.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "global_step": self.global_step,
                 "epoch": self.epoch,

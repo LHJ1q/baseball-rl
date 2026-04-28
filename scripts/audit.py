@@ -775,6 +775,25 @@ def check_param_count_invariant() -> CheckResult:
     )
 
 
+def check_init_stats() -> CheckResult:
+    """Verify modern init: pitcher embedding weights are truncated-normal N(0, 0.02),
+    not PyTorch default ~N(0, 1). Catches a regression that silently reverts the
+    init pass added in the Tier 1 SOTA upgrade."""
+    if not (TOKENS_DIR / "vocab.json").exists():
+        return CheckResult(
+            "24. modern init applied (truncated-normal N(0, 0.02))", "WARN",
+            "skipped — data/tokens/ not populated",
+        )
+    model = build_qtransformer(TOKENS_DIR, preset="smoke")
+    std = model.pre_encoder.emb_pitcher.weight.std().item()
+    ok = 0.015 < std < 0.025
+    return CheckResult(
+        "24. modern init applied (truncated-normal N(0, 0.02))",
+        "PASS" if ok else "FAIL",
+        f"emb_pitcher std={std:.4f} (expected 0.02 ± 0.005)",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
@@ -825,6 +844,7 @@ def main() -> None:
         check_is_terminal_aligns_with_events(),
         check_strike_zone_invariant(),
         check_per_pa_reward_preserved_through_pipeline(),
+        check_init_stats(),
     ]
     print(format_report(results))
     if any(r.status == "FAIL" for r in results):

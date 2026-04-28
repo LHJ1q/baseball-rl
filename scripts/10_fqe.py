@@ -55,6 +55,8 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--gamma", type=float, default=None)
     parser.add_argument("--no-bf16", action="store_true")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile on fqe_model (default: enabled on CUDA).")
     parser.add_argument("--seed", type=int, default=None)
 
     parser.add_argument("--smoke-train", action="store_true",

@@ -194,9 +194,11 @@ Both encoder and Q-Transformer configs are dataclasses (`EncoderConfig`, `QTrans
 
 `src/trainer.py`, `src/eval.py`, `scripts/08_train.py`. Components:
 
-- PA-grouped dataloader from `src/dataset.py` with worker prefetch (`num_workers`).
-- BF16 autocast on CUDA (auto-falls-back to fp32 on CPU/MPS — Macbook smoke uses fp32).
-- AdamW + linear-warmup-then-cosine-decay LR schedule (`cosine_warmup_lr`).
+- PA-grouped dataloader from `src/dataset.py` with worker prefetch (`num_workers`, `persistent_workers=True`, `prefetch_factor=4`). Persistent workers stay warm across epochs and prefetch keeps the bottleneck (parquet I/O + Python `pa_collate`) ahead of GPU compute.
+- BF16 autocast on CUDA (auto-falls-back to fp32 on CPU/MPS — Macbook smoke uses fp32). Also sets `torch.set_float32_matmul_precision("high")` (TF32) on CUDA so the fp32 corners (standardization buffers, attention bias compute) don't bottleneck.
+- AdamW + linear-warmup-then-cosine-decay LR schedule (`cosine_warmup_lr`). Cosine decays to `min_lr_factor * base_lr` (default `min_lr_factor=0.1`), NOT to 0. Recovers the last ~10% of training where the previous schedule was effectively idle (Chinchilla / Llama practice).
+- `torch.compile(model, dynamic=True)` on CUDA (default ON; CLI `--no-compile` to disable; auto-skipped on MPS/CPU). `dynamic=True` is mandatory because `pa_collate` produces variable `T_max`. Compile is applied AFTER optimizer creation; checkpoint save/load unwraps the `_orig_mod.` prefix so compiled and uncompiled checkpoints are interchangeable. Expected ~1.2-1.5× speedup; combined with dataloader hot-path settings ~1.5-2× over pre-commit baseline.
+- Modern weight init (GPT-2 / Llama style): truncated-normal `N(0, 0.02)` on every `nn.Linear` and `nn.Embedding`, plus residual-output projections (`self_attn.out_proj`, FFN `linear2`) scaled by `1/sqrt(2 * n_layers)` for deep stability. **Mid-training loss curves are NOT directly comparable** to pre-commit runs — init affects path, not destination, so converged eval / OPE numbers ARE comparable (modulo small variance).
 - IQL Q+V loss (TD on Q with V bootstrap; expectile regression on V). Loss helper in `src/qtransformer.py:iql_losses`.
 - Gradient clipping at `cfg.grad_clip` (default 1.0).
 - Checkpointing: `checkpoint_latest.pt` every epoch, `checkpoint_epoch_{N}.pt` periodic, `checkpoint_best.pt` on best val Q-loss.
@@ -320,7 +322,22 @@ These are real semantic gaps from the canonical Q-Transformer / IQL recipe that 
 
 - **CQL-lite penalty on x and z heads** (~60 LOC). The repertoire mask (when enabled) only filters `pitch_type`; the x_bin and z_bin heads still extrapolate Q upward on rare locations for a given pitcher. Add a soft penalty `α · log Σ_x exp(Q(s, type, x))` (and same for z) to suppress OOD-action Q. Closes the conservatism gap on non-type axes.
 
+- **Tier 2a — QK-norm** (~150 LOC, custom attention required since `nn.MultiheadAttention` doesn't expose Q/K post-projection). LayerNorm/RMSNorm on Q and K before attention prevents attention-logit divergence on long offline-RL training runs where TD targets can amplify small instabilities. Closest thing in Tier 2 to a real impact at our scale.
+
+- **Tier 2b — SwiGLU + RMSNorm** (~120 LOC, custom encoder layer). Modern LLM standard; quality polish for offline-RL Q-fitting at 12M params is unlikely to be large but ~5% throughput from RMSNorm is real. Both tier-2 changes would live in `src/qtransformer.py` next to a config flag (`encoder_layer_kind: "modern" | "default"`, default `"default"`) for A/B testing.
+
+- **Tier 3 — Model EMA for evaluation** (~40 LOC + checkpoint serialization). Distinct from EMA target Q-network above: maintain a Polyak-averaged copy of the model and use IT for eval/inference. Default `τ_ema = 0.9999` (configurable via `--tau-ema`) — at v1's 55,800-step horizon (40 epochs × 1,394 steps) this gives ~8 half-lives so init contribution decays to ~0 with averaging window over ~18% of training. Drop to `0.999` only for short fine-tunes (<10K steps); raise to `0.99999` only at 100K+ step scales (would be init-dominated at v1 scale). When changing batch size, scale `τ_ema` proportionally so the half-life count stays similar.
+
 None of these block training v1. Decide order based on what eval surfaces (e.g., if val q_loss diverges late → add EMA target first; if FQE's per-PA value seems systematically pessimistic → add MC bound first).
+
+### Phase 8 GPU-run runbook
+
+These are post-shipping checks for the first real Blackwell run, not blockers for the commit:
+
+- **SDPA / FlashAttention check (eager AND compiled).** `nn.TransformerEncoderLayer` falls back to slow eager attention when `key_padding_mask` is supplied AND `enable_nested_tensor=False` (both true for us). Wrap one forward in `torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False)` — if it raises, we're on math fallback. Workaround: merge `key_padding_mask` into the additive attention mask manually. **Likely a bigger wall-clock win than `torch.compile` if math fallback is hit.** Repeat the same check on the compiled model — `torch.compile` traces operators and can re-route attention through a non-Flash path.
+- **`torch.compile` graph cache check.** Verify the graph cache hits on the second batch with a different `T_max` (no recompile message). If recompiling per shape, fall back to `dynamic=False` + fixed-`T_max` padding in `pa_collate`.
+- **Batch-size probe.** After the baseline batch=512 run completes a few epochs, capture `nvidia-smi` SM utilization. If GPU is < 70% utilized AND VRAM headroom > 6 GB, retry with batch=1024 (steps_per_epoch halves to 697; total_steps halves to 27,880; throughput likely doubles). When changing batch size, scale `τ_ema` (Tier 3) proportionally to maintain ~8× half-life convergence.
+- **Post-training OPE diagnostics.** If `behavioral_report.md` flags an unusual ST vs SL ratio in the policy's pitch-type distribution, **suspect 2021-2022 train-data label drift before suspecting a model defect.** Statcast retroactively (but selectively) relabeled some pre-2023 sliders as sweepers. Cheap mitigation is the ST→SL collapse in tokenization (already documented below). Physics features in `pitcher_arsenal` partly compensate, so absolute OPE numbers remain meaningful — just don't over-interpret the breaking-ball type breakdown.
 
 ### Future tokenization improvements (deferred)
 

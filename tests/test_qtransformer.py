@@ -1,6 +1,8 @@
 """Unit tests for src/qtransformer.py."""
 from __future__ import annotations
 
+import math
+
 import torch
 
 from src.dataset import PABatch
@@ -274,3 +276,61 @@ def test_policy_runs_in_eval_mode():
     assert torch.equal(out1["pitch_type"], out2["pitch_type"])
     assert torch.equal(out1["x_bin"], out2["x_bin"])
     assert torch.equal(out1["z_bin"], out2["z_bin"])
+
+
+# --------------------------------------------------------------------------- #
+# Modern (truncated-normal + residual scaling) init
+# --------------------------------------------------------------------------- #
+
+
+def _fresh_model(n_layers: int = 2) -> QTransformer:
+    cfg = QTransformerConfig(d_model=32, n_layers=n_layers, n_heads=4, d_ff=64,
+                             n_x_bins=N_X, n_z_bins=N_Z)
+    return QTransformer(VOCAB_SIZES, cfg=cfg, encoder_cfg=EncoderConfig(d_model=32, d_player_emb=8))
+
+
+def test_weight_init_embedding_std():
+    """Pitcher embedding should be truncated-normal N(0, 0.02), not PyTorch default ~N(0, 1)."""
+    model = _fresh_model()
+    std = model.pre_encoder.emb_pitcher.weight.std().item()
+    assert 0.015 < std < 0.025, f"emb_pitcher std={std} outside expected ~0.02 band"
+
+
+def test_weight_init_linear_unscaled():
+    """A Linear OUTSIDE self.transformer.layers should retain truncated-normal std ~0.02
+    (no residual scaling). Catches a missing isinstance(m, nn.Linear) branch in _init_weights
+    that would silently leave outer Linears at PyTorch default."""
+    model = _fresh_model()
+    # q_head_z is nn.Sequential(Linear, GELU, Dropout, Linear) — first Linear is unscaled.
+    w = model.q_head_z[0].weight
+    std = w.std().item()
+    assert 0.015 < std < 0.025, f"q_head_z[0] std={std} not near 0.02 — _init_weights missed it"
+
+
+def test_weight_init_residual_scaling():
+    """Per-layer attention out_proj and FFN out (linear2) should be scaled by 1/sqrt(2*n_layers).
+    For n_layers=2: expected std ≈ 0.02 / sqrt(4) = 0.01."""
+    n_layers = 2
+    model = _fresh_model(n_layers=n_layers)
+    expected = 0.02 / math.sqrt(2 * n_layers)
+    for layer in model.transformer.layers:
+        attn_std = layer.self_attn.out_proj.weight.std().item()
+        ffn_std = layer.linear2.weight.std().item()
+        # Wide-ish band — truncated-normal sample std ≠ population std exactly.
+        assert 0.6 * expected < attn_std < 1.4 * expected, \
+            f"attn out_proj std={attn_std}, expected ~{expected}"
+        assert 0.6 * expected < ffn_std < 1.4 * expected, \
+            f"ffn linear2 std={ffn_std}, expected ~{expected}"
+
+
+def test_weight_init_no_nan():
+    """Fresh model: forward + backward produces a finite loss. Catches catastrophic init."""
+    model = _fresh_model()
+    batch = _make_batch(B=2, T=3)
+    out = model(batch)
+    loss = out["q_chosen"].sum() + out["v"].sum()
+    loss.backward()
+    assert torch.isfinite(loss), f"loss not finite: {loss}"
+    for n, p in model.named_parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), f"non-finite grad in {n}"

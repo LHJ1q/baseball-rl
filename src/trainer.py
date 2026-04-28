@@ -66,6 +66,13 @@ class TrainerConfig:
     # Mixed precision (BF16 on CUDA only — Macbook MPS/CPU falls back to fp32)
     bf16: bool = True
 
+    # Cosine LR floor — final LR = min_lr_factor * base_lr (was decay to 0)
+    min_lr_factor: float = 0.1
+
+    # torch.compile on CUDA (auto-skipped on MPS/CPU). dynamic=True is
+    # mandatory because pa_collate produces variable T_max batches.
+    compile: bool = True
+
     # Reproducibility
     seed: int = 0
 
@@ -78,14 +85,25 @@ class TrainerConfig:
 # --------------------------------------------------------------------------- #
 
 
-def cosine_warmup_lr(step: int, *, base_lr: float, warmup_steps: int, total_steps: int) -> float:
-    """Linear warmup over ``warmup_steps`` then cosine decay to 0 over the
-    remaining steps. Always returns a positive scalar."""
+def cosine_warmup_lr(
+    step: int, *, base_lr: float, warmup_steps: int, total_steps: int,
+    min_lr_factor: float = 0.1,
+) -> float:
+    """Linear warmup over ``warmup_steps`` then cosine decay from ``base_lr``
+    to ``min_lr_factor * base_lr`` over the remaining steps.
+
+    The floor (default 0.1 × base_lr) prevents the last ~10% of training from
+    doing nothing, which the previous decay-to-0 schedule effectively was.
+    Matches Chinchilla / Llama practice. The clamp also holds past
+    ``total_steps`` (a real case when resume sets ``global_step >= total_steps``
+    after ``--epochs`` is decreased).
+    """
     if step < warmup_steps:
         return base_lr * (step + 1) / max(warmup_steps, 1)
     progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
     progress = min(max(progress, 0.0), 1.0)
-    return 0.5 * base_lr * (1.0 + math.cos(math.pi * progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))   # in [0, 1]
+    return base_lr * (min_lr_factor + (1.0 - min_lr_factor) * cosine)
 
 
 # --------------------------------------------------------------------------- #
@@ -114,12 +132,24 @@ class Trainer:
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
+        # Enable TF32 paths for fp32 matmuls (BF16 autocast covers most of
+        # forward/backward, but fp32 corners — standardization buffers,
+        # attention bias compute — still benefit).
+        if self.device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+
         self.model.to(self.device)
 
         torch.manual_seed(cfg.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(cfg.seed)
 
+        # Dataloader hot-path: keep workers warm + prefetch ahead. The
+        # bottleneck is parquet I/O + pa_collate, so persistent_workers
+        # avoids re-spawning workers each epoch and prefetch_factor=4 keeps
+        # the GPU fed.
+        _persist = cfg.num_workers > 0
+        _prefetch = 4 if cfg.num_workers > 0 else None
         self.train_loader = DataLoader(
             train_ds,
             batch_size=cfg.batch_size,
@@ -128,6 +158,8 @@ class Trainer:
             pin_memory=cfg.pin_memory and self.device.type == "cuda",
             collate_fn=pa_collate,
             drop_last=True,
+            persistent_workers=_persist,
+            prefetch_factor=_prefetch,
         )
         self.val_loader = DataLoader(
             val_ds,
@@ -136,6 +168,8 @@ class Trainer:
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory and self.device.type == "cuda",
             collate_fn=pa_collate,
+            persistent_workers=_persist,
+            prefetch_factor=_prefetch,
         )
 
         self.steps_per_epoch = max(1, len(self.train_loader))
@@ -147,6 +181,16 @@ class Trainer:
             betas=cfg.betas,
             weight_decay=cfg.weight_decay,
         )
+
+        # torch.compile MUST come AFTER optimizer creation. If we compile first,
+        # self.model.parameters() returns _orig_mod-prefixed parameter names and
+        # the optimizer holds references through the wrapper — complicates the
+        # save/load path. Compiling after lets the optimizer hold the underlying
+        # tensors directly while torch.compile only wraps the forward pass.
+        # Standard nanoGPT / HuggingFace Trainer pattern.
+        if cfg.compile and self.device.type == "cuda":
+            self.model = torch.compile(self.model, dynamic=True)
+            logger.info("torch.compile(model, dynamic=True) applied (CUDA)")
 
         self._use_bf16 = cfg.bf16 and self.device.type == "cuda"
         if cfg.bf16 and not self._use_bf16:
@@ -212,6 +256,7 @@ class Trainer:
             base_lr=self.cfg.lr,
             warmup_steps=self.cfg.warmup_steps,
             total_steps=self.total_steps,
+            min_lr_factor=self.cfg.min_lr_factor,
         )
         for g in self.optimizer.param_groups:
             g["lr"] = lr
@@ -275,8 +320,13 @@ class Trainer:
     # --------------------------------------------------------------------- #
 
     def save_checkpoint(self, path: Path) -> None:
+        # Unwrap if torch.compile wrapped the model — its state_dict adds an
+        # `_orig_mod.` prefix to every key. Save the unwrapped state so the
+        # checkpoint is loadable by uncompiled models too (e.g., FQE's
+        # policy_model.load_state_dict path in scripts/10_fqe.py).
+        underlying = getattr(self.model, "_orig_mod", self.model)
         payload = {
-            "model": self.model.state_dict(),
+            "model": underlying.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "global_step": self.global_step,
             "epoch": self.epoch,
@@ -287,7 +337,13 @@ class Trainer:
 
     def load_checkpoint(self, path: Path) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(payload["model"])
+        # Strip _orig_mod. prefix from any incoming state (in case the ckpt was
+        # saved by a path that didn't unwrap). Belt-and-suspenders.
+        state = payload["model"]
+        if any(k.startswith("_orig_mod.") for k in state.keys()):
+            state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        underlying = getattr(self.model, "_orig_mod", self.model)
+        underlying.load_state_dict(state)
         self.optimizer.load_state_dict(payload["optimizer"])
         self.global_step = payload["global_step"]
         self.epoch = payload["epoch"]

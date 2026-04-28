@@ -43,9 +43,29 @@ def test_cosine_warmup_reaches_base_lr_at_warmup_end():
     assert lr == pytest.approx(1e-3, rel=1e-3)
 
 
-def test_cosine_warmup_reaches_zero_at_end():
-    lr = cosine_warmup_lr(step=1000, base_lr=1e-3, warmup_steps=100, total_steps=1000)
-    assert lr == pytest.approx(0.0, abs=1e-9)
+def test_cosine_warmup_lr_default_floor_is_nonzero():
+    """Default min_lr_factor=0.1 → final LR should be ~10% of base, not 0."""
+    base = 1e-3
+    lr = cosine_warmup_lr(step=1000, base_lr=base, warmup_steps=100, total_steps=1000)
+    assert lr == pytest.approx(0.1 * base, rel=1e-6)
+    assert lr > 0
+
+
+def test_cosine_warmup_lr_min_floor():
+    """Explicit min_lr_factor=0.1 at step==total_steps returns exactly 0.1*base_lr."""
+    base = 1e-3
+    lr = cosine_warmup_lr(step=1000, base_lr=base, warmup_steps=100, total_steps=1000,
+                          min_lr_factor=0.1)
+    assert lr == pytest.approx(0.1 * base, rel=1e-6)
+
+
+def test_cosine_warmup_lr_floor_holds_past_total_steps():
+    """If global_step exceeds total_steps (e.g. resume after --epochs decreased),
+    LR should clamp at the floor, NOT continue decreasing or return 0."""
+    base = 1e-3
+    lr = cosine_warmup_lr(step=2000, base_lr=base, warmup_steps=100, total_steps=1000,
+                          min_lr_factor=0.1)
+    assert lr == pytest.approx(0.1 * base, rel=1e-6)
 
 
 def test_cosine_warmup_is_monotone_decreasing_after_warmup():
@@ -224,6 +244,38 @@ def test_trainer_load_checkpoint_warns_on_epochs_mismatch(caplog):
             trainer2.load_checkpoint(ckpt)
         assert any("EPOCHS MISMATCH ON RESUME" in r.message for r in caplog.records), \
             "expected warning about epochs mismatch on resume"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile only enabled on CUDA")
+def test_compile_checkpoint_roundtrip():
+    """Save from a torch.compile()'d model, load into an uncompiled model — outputs match.
+    Catches the _orig_mod. prefix bug in save/load."""
+    model = _tiny_model().cuda()
+    compiled = torch.compile(model, dynamic=True)
+
+    # Build a synthetic batch on CUDA
+    train_ds = _SyntheticPADataset(n_items=4)
+    batch = pa_collate([train_ds[0], train_ds[1]])
+    # Move tensors to CUDA
+    for k, v in vars(batch).items():
+        if isinstance(v, torch.Tensor):
+            setattr(batch, k, v.cuda())
+
+    compiled.eval(); model.eval()
+    with torch.no_grad():
+        out_compiled = compiled(batch)["q_chosen"].clone()
+
+    # Save state via the unwrap pattern Trainer.save_checkpoint uses
+    underlying = getattr(compiled, "_orig_mod", compiled)
+    state = underlying.state_dict()
+
+    # Load into a fresh, uncompiled model
+    fresh = _tiny_model().cuda()
+    fresh.load_state_dict(state)
+    fresh.eval()
+    with torch.no_grad():
+        out_fresh = fresh(batch)["q_chosen"]
+    torch.testing.assert_close(out_compiled, out_fresh)
 
 
 def test_trainer_load_checkpoint_silent_when_epochs_match(caplog):

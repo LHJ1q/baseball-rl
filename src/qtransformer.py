@@ -10,6 +10,7 @@ and a deterministic ``policy()`` for inference.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -157,6 +158,30 @@ class QTransformer(nn.Module):
 
         # IQL value head — state only, no per-type conditioning.
         self.v_head = _mlp_head(d_h, 1)
+
+        # Modern transformer init (GPT-2/3 / Llama style):
+        #   - Pass 1: truncated-normal N(0, 0.02) for every Linear and Embedding.
+        #   - Pass 2: scale residual output projections (attention out + FFN out)
+        #     by 1/sqrt(2 * n_layers) — improves deep stability.
+        # `self.apply(_init_weights)` cannot distinguish residual outputs from
+        # head MLPs, so the residual scaling is a separate explicit pass.
+        self.apply(self._init_weights)
+        for layer in self.transformer.layers:
+            scale = 1.0 / math.sqrt(2 * self.cfg.n_layers)
+            with torch.no_grad():
+                layer.self_attn.out_proj.weight.mul_(scale)
+                layer.linear2.weight.mul_(scale)  # FFN output projection
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        """Truncated-normal N(0, 0.02) init for Linear weights, Embedding rows,
+        and Linear biases (zero-init). Standard GPT-2 / Llama init."""
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02, a=-2 * 0.02, b=2 * 0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.trunc_normal_(module.weight, std=0.02, a=-2 * 0.02, b=2 * 0.02)
 
     # --------------------------------------------------------------------- #
     # Sequence build + transformer

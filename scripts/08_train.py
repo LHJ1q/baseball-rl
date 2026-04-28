@@ -89,6 +89,9 @@ def main() -> None:
     parser.add_argument("--pitcher-dropout", type=float, default=None)
     parser.add_argument("--no-bf16", action="store_true",
                         help="Force fp32 even on CUDA (default uses BF16 on CUDA).")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile (default: enabled on CUDA, ~1.2-1.5x speedup; "
+                             "auto-skipped on Macbook MPS/CPU).")
     parser.add_argument("--no-pitcher-blind-eval", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
 
@@ -126,6 +129,8 @@ def main() -> None:
             setattr(trainer_cfg, k, v)
     if args.no_bf16:
         trainer_cfg.bf16 = False
+    if args.no_compile:
+        trainer_cfg.compile = False
     if args.no_pitcher_blind_eval:
         trainer_cfg.include_pitcher_blind_eval = False
 
