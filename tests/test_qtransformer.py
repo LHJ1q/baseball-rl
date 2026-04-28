@@ -92,20 +92,86 @@ def test_expectile_loss_asymmetry():
 
 
 def test_iql_loss_terminal_drops_bootstrap():
-    """At a terminal pitch, target should equal reward (no γV(s')) regardless of v_next.
-    All three Q heads contribute equally (each is 0.25) so total q_loss = 0.75."""
+    """At a terminal pitch, target_z = r (no γV(s')) regardless of v_next.
+    Per-axis backup: q_loss_z = (q_z - r)^2 = (0 - 0.5)^2 = 0.25.
+    Shallow heads have moving targets from logits; we don't assert on them."""
     q = torch.tensor([[0.0]])
     v = torch.tensor([[0.0]])
-    v_next = torch.tensor([[100.0]])  # huge — should be ignored
+    v_next = torch.tensor([[100.0]])  # huge — should be ignored on terminal
     r = torch.tensor([[0.5]])
     term = torch.tensor([[True]])
     mask = torch.tensor([[True]])
+    n_x, n_z = 4, 4
+    q_x_logits = torch.zeros(1, 1, n_x)
+    q_z_logits = torch.zeros(1, 1, n_z)
     losses = iql_losses(q_type=q, q_x=q, q_z=q,
+                       q_x_logits=q_x_logits, q_z_logits=q_z_logits,
                        v_current=v, v_next=v_next, reward=r,
                        is_terminal=term, valid_mask=mask, gamma=1.0, tau=0.7)
-    # Each head: target = r = 0.5, q = 0 → per-head loss = 0.25; sum = 0.75
-    assert abs(losses["q_loss"].item() - 0.75) < 1e-6
+    # Deepest head: target = r = 0.5, q = 0 → per-head loss = 0.25
     assert abs(losses["q_loss_z"].item() - 0.25) < 1e-6
+
+
+def test_iql_loss_per_axis_targets_match_spec():
+    """Verify the per-axis Bellman backup uses the right targets:
+    - target_type = max over q_x_logits
+    - target_x    = max over q_z_logits
+    - target_z    = r + γ * V(s') * (1 - terminal)
+    """
+    B, T, n_x, n_z = 1, 1, 4, 4
+    q_type = torch.tensor([[2.0]])
+    q_x = torch.tensor([[3.0]])
+    q_z = torch.tensor([[1.0]])
+    # Hand-crafted logits with known max: q_x_logits.max = 7.0, q_z_logits.max = 5.0
+    q_x_logits = torch.tensor([[[1.0, 7.0, 2.0, 3.0]]])
+    q_z_logits = torch.tensor([[[5.0, 1.0, 2.0, 3.0]]])
+    v_current = torch.tensor([[0.0]])
+    v_next = torch.tensor([[10.0]])
+    reward = torch.tensor([[0.5]])
+    is_terminal = torch.tensor([[False]])
+    valid_mask = torch.tensor([[True]])
+
+    losses = iql_losses(
+        q_type=q_type, q_x=q_x, q_z=q_z,
+        q_x_logits=q_x_logits, q_z_logits=q_z_logits,
+        v_current=v_current, v_next=v_next, reward=reward,
+        is_terminal=is_terminal, valid_mask=valid_mask,
+        gamma=1.0, tau=0.7,
+    )
+    # target_type = max(q_x_logits) = 7.0; q_loss_type = (q_type - 7.0)^2 = (2 - 7)^2 = 25
+    assert abs(losses["q_loss_type"].item() - 25.0) < 1e-5
+    # target_x = max(q_z_logits) = 5.0; q_loss_x = (q_x - 5.0)^2 = (3 - 5)^2 = 4
+    assert abs(losses["q_loss_x"].item() - 4.0) < 1e-5
+    # target_z = r + γV(s') = 0.5 + 1.0 * 10.0 = 10.5; q_loss_z = (q_z - 10.5)^2 = (1 - 10.5)^2 = 90.25
+    assert abs(losses["q_loss_z"].item() - 90.25) < 1e-5
+
+
+def test_iql_q_loss_z_does_not_grad_through_v_next():
+    """target_z must be detached so q_loss_z's gradient does NOT flow back into V.
+    Cleanest test: pass a leaf v_next with requires_grad=True, backward q_loss_z,
+    assert v_next.grad is None."""
+    B, T, n_x, n_z = 2, 3, 4, 4
+    q_type = torch.zeros(B, T, requires_grad=True)
+    q_x = torch.zeros(B, T, requires_grad=True)
+    q_z = torch.zeros(B, T, requires_grad=True)
+    q_x_logits = torch.zeros(B, T, n_x)
+    q_z_logits = torch.zeros(B, T, n_z)
+    v_current = torch.zeros(B, T, requires_grad=True)
+    v_next = torch.randn(B, T, requires_grad=True)
+    reward = torch.randn(B, T)
+    is_terminal = torch.zeros(B, T, dtype=torch.bool); is_terminal[:, -1] = True
+    valid_mask = torch.ones(B, T, dtype=torch.bool)
+
+    losses = iql_losses(
+        q_type=q_type, q_x=q_x, q_z=q_z,
+        q_x_logits=q_x_logits, q_z_logits=q_z_logits,
+        v_current=v_current, v_next=v_next, reward=reward,
+        is_terminal=is_terminal, valid_mask=valid_mask,
+        gamma=1.0, tau=0.7,
+    )
+    losses["q_loss_z"].backward()
+    # target_z is detached → v_next gets no gradient from q_loss_z
+    assert v_next.grad is None, f"v_next.grad should be None (target_z must be detached); got {v_next.grad}"
 
 
 def test_shift_v_for_next_state_pads_last_with_zero():

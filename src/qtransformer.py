@@ -351,6 +351,8 @@ def iql_losses(
     q_type: torch.Tensor,          # (B, T) chosen-type Q from q_head_type
     q_x: torch.Tensor,             # (B, T) chosen-(type, x) Q from q_head_x
     q_z: torch.Tensor,             # (B, T) chosen-(type, x, z) Q from q_head_z (deepest)
+    q_x_logits: torch.Tensor,      # (B, T, n_x_bins) — for target of q_type (max over x given type)
+    q_z_logits: torch.Tensor,      # (B, T, n_z_bins) — for target of q_x (max over z given type, x)
     v_current: torch.Tensor,       # (B, T) V at current state
     v_next: torch.Tensor,          # (B, T) V at next state (s_{t+1})
     reward: torch.Tensor,          # (B, T)
@@ -360,30 +362,54 @@ def iql_losses(
     gamma: float = 1.0,
     tau: float = 0.7,
 ) -> dict[str, torch.Tensor]:
-    """Returns ``{q_loss, v_loss, q_loss_type, q_loss_x, q_loss_z}`` averaged
-    over valid positions.
+    """Q-Transformer per-axis Bellman backup combined with IQL's V-bootstrap on
+    the deepest axis. Each autoregressive head has its own target, derived from
+    the next axis's max (no reward, no discount within the same timestep); only
+    the deepest head bootstraps from the *next state* via V.
 
-    All three autoregressive Q-heads must be trained — at inference the policy
-    argmaxes over each head in turn, so any untrained head yields random
-    behavior at that action axis. We train each head on the same TD target
-    (the chosen action's value), summing the three Q-losses.
+    Targets:
 
-    Q-loss: TD with V (no max over actions — IQL's key trick).
-        target = r + γ · V(s') · (1 − terminal)
-        L_Q   = MSE(Q_type, target) + MSE(Q_x, target) + MSE(Q_z, target)
+    +-------------------+------------------------------------------------------+
+    | Axis              | Target                                               |
+    +===================+======================================================+
+    | Q(s, type)        | ``max_x Q(s, type, x)``    (no reward, no γ)         |
+    | Q(s, type, x)     | ``max_z Q(s, type, x, z)`` (no reward, no γ)         |
+    | Q(s, type, x, z)  | ``r + γ · V(s') · (1 − terminal)``  (IQL TD target)  |
+    +-------------------+------------------------------------------------------+
 
-    V-loss: expectile regression of Q under the data distribution.
-        L_V   = expectile_loss(Q_z(s, a) − V(s), tau)
+    All three targets are ``.detach()``'d. Gradient flows on each head only via
+    its own loss term; V receives gradient only through ``v_loss`` (not through
+    ``q_loss_z``).
 
-    V is bootstrapped from the deepest head Q_z (most-refined estimate).
+    Per-axis dependency chain (debug guidance): q_z's target is stationary-ish
+    (depends only on r + γV(s')); q_x's target depends on q_z's logits → moving
+    target; q_type's target depends on q_x's logits → moving target. **Ceteris
+    paribus, q_z converges first**, then q_x, then q_type. **Caveat:** this
+    ordering assumes the encoder is already producing useful state
+    representations — if the encoder is the bottleneck, all three heads stall
+    together. A debugger seeing slow ``q_loss_type`` should investigate the
+    encoder before reweighting losses.
+
+    V_next pad invariant: ``shift_v_for_next_state`` produces a zero at the
+    last position of each PA. That zero is correctly multiplied by
+    ``(~is_terminal)`` = 0 because of the upstream filter-time invariant
+    that every PA ends with ``is_terminal[T-1] = True`` (enforced in
+    ``src/filter.py::add_derived_columns``). No runtime assertion here — paid
+    every step in the BF16 hot loop — but a regression in the filter would
+    silently break this. The 14-check ``scripts/04_verify.py`` catches it
+    upstream.
     """
-    target = reward + gamma * v_next * (~is_terminal).float()
     mask = valid_mask.float()
     n = mask.sum().clamp_min(1.0)
 
-    q_loss_type = (((q_type - target).pow(2)) * mask).sum() / n
-    q_loss_x = (((q_x - target).pow(2)) * mask).sum() / n
-    q_loss_z = (((q_z - target).pow(2)) * mask).sum() / n
+    # Per-axis targets — all detached so gradient flows only through the head's input.
+    target_type = q_x_logits.detach().max(dim=-1).values     # max over x bins | chosen type
+    target_x = q_z_logits.detach().max(dim=-1).values        # max over z bins | chosen type, x
+    target_z = (reward + gamma * v_next * (~is_terminal).float()).detach()
+
+    q_loss_type = (((q_type - target_type).pow(2)) * mask).sum() / n
+    q_loss_x = (((q_x - target_x).pow(2)) * mask).sum() / n
+    q_loss_z = (((q_z - target_z).pow(2)) * mask).sum() / n
     q_loss = q_loss_type + q_loss_x + q_loss_z
 
     v_diff = q_z.detach() - v_current

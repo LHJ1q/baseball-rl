@@ -57,6 +57,9 @@ def test_fqe_loss_returns_finite_scalar():
     assert torch.isfinite(out["fqe_loss"]).item()
     assert torch.isfinite(out["q_mean"]).item()
     assert torch.isfinite(out["target_mean"]).item()
+    # FQE returns ONLY fqe_loss (q_z), not per-axis variants — shallow heads are deliberately untrained.
+    assert "fqe_loss_type" not in out
+    assert "fqe_loss_x" not in out
 
 
 def test_fqe_loss_terminal_target_equals_reward():
@@ -84,6 +87,34 @@ def test_fqe_loss_terminal_target_equals_reward():
     out = fqe_loss(fqe, policy, batch, gamma=1.0)
     # target_mean should equal reward_mean = 0.5
     assert out["target_mean"].item() == pytest.approx(0.5, rel=1e-5)
+
+
+def test_fqe_loss_does_not_train_shallow_heads():
+    """FQE trains ONLY q_head_z. The shallow heads (q_head_type, q_head_x) and
+    v_head must receive zero gradient from fqe_loss — using them would either be
+    wasted compute (v_head) or actively harmful (max over q_x/q_z logits computes
+    Q*, biasing FQE upward). Catches a future regression where someone adds
+    shallow losses back to fqe_loss."""
+    fqe = _tiny_model()
+    policy = _tiny_model()
+    for p in policy.parameters():
+        p.requires_grad_(False)
+    batch = _make_batch()
+    fqe.zero_grad()
+    out = fqe_loss(fqe, policy, batch, gamma=1.0)
+    out["fqe_loss"].backward()
+
+    EXPECTED_NO_GRAD_PREFIXES = ("q_head_type.", "q_head_x.", "v_head.")
+    bad: list[str] = []
+    for name, p in fqe.named_parameters():
+        if name.startswith(EXPECTED_NO_GRAD_PREFIXES):
+            if p.grad is not None and p.grad.abs().sum().item() > 0.0:
+                bad.append(name)
+    assert not bad, (
+        f"FQE should not train shallow heads or v_head, but these got gradient: {bad[:5]}. "
+        "Someone may have re-added shallow losses to fqe_loss — that biases the FQE "
+        "estimate upward (computes Q* instead of Q^π)."
+    )
 
 
 def test_estimate_pa_values_returns_finite_estimates():

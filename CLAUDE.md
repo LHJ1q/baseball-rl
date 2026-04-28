@@ -224,6 +224,20 @@ epoch  12 | step  4800 | train q=0.0345 v=0.0118 | val q=0.0398 v=0.0142 | blind
 
 The `gap` column is the pitcher-blind eval signal: bigger = more pitcher-specific behavior; near zero = model leans on general rules.
 
+### Deviations from canonical Q-Transformer + IQL (intentional, documented)
+
+The implementation **does** match the Q-Transformer paper (Chebotar et al. 2023) on architecture and the per-axis Bellman backup for IQL. It deviates in a few places — all deliberate:
+
+| Deviation | What canonical does | What we do | Rationale |
+|---|---|---|---|
+| **Deepest-axis target** | `Q(s, type, x, z) ← r + γ · max_{type'} Q(s', type')` | `Q(s, type, x, z) ← r + γ · V(s')` (IQL substitute) | Avoids the max over next-state actions on out-of-distribution samples — that's IQL's entire point. The shallow axes still use within-timestep maxes (which are over IN-distribution actions for the given pitcher, so safe). |
+| **Policy extraction** | Standard IQL: AWR — `π(a\|s) ∝ exp(β · A(s, a))` then BC-regress | Greedy argmax over Q-heads + repertoire mask | Discrete action space; argmax is well-defined. AWR adds a `β` hyperparameter and a separate policy network — defensible to skip for v1. V's role here is purely the bootstrap target for `q_z`, not policy extraction. |
+| **Conservative penalty** | Common: CQL adds an explicit OOD-action regularizer to the Q-loss | None beyond IQL's expectile-V (which is the standard IQL conservatism) + the inference-time repertoire mask | The expectile-V is the IQL conservatism. CQL is a different recipe; we picked one. |
+| **Repertoire mask timing** | Canonical Q-Transformer doesn't have the concept | Inference-only (training Q-loss is computed on all observed actions, regardless of repertoire) | Modest training-time efficiency loss; semantically clean. The mask is for "physically impossible," not "rare for this pitcher" — at training we have data for whatever pitchers DID throw. |
+| **FQE shallow-head training** | n/a (Q-Transformer paper doesn't run FQE on its own model) | FQE trains ONLY `q_head_z` (deepest); `q_head_type` and `q_head_x` are intentionally untrained in FQE | A per-axis max in FQE would compute `Q*` (optimal value), biasing the estimate upward — exactly the optimism FQE is supposed to avoid. `estimate_pa_values` only consumes `q_z`, so the shallow heads would be wasted-and-harmful compute. |
+
+These trade-offs are tracked by `tests/test_qtransformer.py:test_iql_loss_per_axis_targets_match_spec`, `tests/test_fqe.py:test_fqe_loss_does_not_train_shallow_heads`, and `scripts/audit.py` (checks 5 + 6).
+
 **v1 preset (recommended for the 2021-2025 scaled training run on Blackwell RTX Pro 4500):**
 
 | Knob | v1 value | Notes |

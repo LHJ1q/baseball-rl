@@ -31,13 +31,15 @@ from src.qtransformer import QTransformer, iql_losses, shift_v_for_next_state
 
 
 def eval_losses(model: QTransformer, batch: PABatch, gamma: float, tau: float) -> dict[str, torch.Tensor]:
-    """Forward + IQL losses. Returns ``{q_loss, v_loss, n_valid}`` (all scalars)."""
+    """Forward + IQL losses. Returns ``{q_loss, v_loss, n_valid, q_loss_type/x/z}``."""
     out = model(batch)
     v_next = shift_v_for_next_state(out["v"], batch.valid_mask)
     losses = iql_losses(
         q_type=out["q_type"],
         q_x=out["q_x"],
         q_z=out["q_z"],
+        q_x_logits=out["q_x_logits"],
+        q_z_logits=out["q_z_logits"],
         v_current=out["v"],
         v_next=v_next,
         reward=batch.reward,
@@ -73,7 +75,21 @@ def eval_pitcher_blind(
     model: QTransformer, batch: PABatch, gamma: float, tau: float
 ) -> dict[str, torch.Tensor]:
     """Same Q+V losses, but with the pitcher embedding zeroed — measures the
-    'general policy' baseline (no pitcher identity info)."""
+    'general policy' baseline (no pitcher identity info).
+
+    NOTE on comparing this to the personalized loss: under per-axis IQL, the
+    targets for ``q_loss_type`` and ``q_loss_x`` are derived from the model's
+    own logits (max over q_x_logits and q_z_logits respectively). Pitcher-
+    blinding zeroes the pitcher embedding for ALL forward passes, so the
+    blind-pass logits *and* the blind-pass targets shift together. The
+    aggregate loss values are therefore not strictly comparable across the two
+    runs in absolute units. The intended diagnostic — "did the loss go up
+    under blinding" → "is the model relying on pitcher identity" — is still
+    valid in *relative* terms; it's just measuring "blind model fits its own
+    blind targets" vs "personalized model fits its own personalized targets,"
+    not a direct fit of the same target. ``q_loss_z``'s target is stationary
+    (depends only on r + γV(s')) and IS directly comparable across the two.
+    """
     with _zeroed_pitcher_embedding(model):
         return eval_losses(model, batch, gamma, tau)
 

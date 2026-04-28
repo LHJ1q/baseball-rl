@@ -199,6 +199,7 @@ def check_gradient_flow_iql() -> CheckResult:
     v_next = shift_v_for_next_state(out["v"], batch.valid_mask)
     losses = iql_losses(
         q_type=out["q_type"], q_x=out["q_x"], q_z=out["q_z"],
+        q_x_logits=out["q_x_logits"], q_z_logits=out["q_z_logits"],
         v_current=out["v"], v_next=v_next,
         reward=batch.reward, is_terminal=batch.is_terminal,
         valid_mask=batch.valid_mask, gamma=1.0, tau=0.7,
@@ -255,38 +256,64 @@ def check_gradient_flow_fqe() -> CheckResult:
     losses = fqe_loss(fqe, policy, batch, gamma=1.0)
     losses["fqe_loss"].backward()
 
-    # FQE is a pure-Q method; v_head is part of the QTransformer architecture
-    # for IQL but not used in FQE training. v_head having no gradient is
-    # *expected* — flag only unexpected no-grad params.
-    no_grad: list[str] = []
+    # FQE trains ONLY q_head_z (the deepest head). The shallow heads
+    # (q_head_type, q_head_x) and v_head are intentionally unused — using a
+    # per-axis max over their logits would compute Q* (optimal value),
+    # biasing FQE estimates upward and defeating its whole point.
+    #
+    # Two-part check:
+    #   Part A (positive negative): assert NO gradient on shallow heads + v_head
+    #   Part B (positive): all other params (encoder/transformer/q_head_z/embeddings) get gradient
+    #
+    # Part A defends against future regressions where someone re-adds the
+    # shallow losses to FQE.
+    EXPECTED_NO_GRAD_PREFIXES = ("q_head_type.", "q_head_x.", "v_head.")
+
+    # Part A: positive assertion that shallow heads + v_head have NO gradient
+    unexpected_grad: list[str] = []
+    for name, p in fqe.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.startswith(EXPECTED_NO_GRAD_PREFIXES):
+            if p.grad is not None and p.grad.abs().sum().item() > 0.0:
+                unexpected_grad.append(name)
+
+    # Part B: the rest should have gradient
+    no_grad_unexpected: list[str] = []
     n_with_grad = 0
     for name, p in fqe.named_parameters():
         if not p.requires_grad:
             continue
-        if name.startswith("v_head"):
-            continue                         # expected unused in FQE
+        if name.startswith(EXPECTED_NO_GRAD_PREFIXES):
+            continue
         if p.grad is None or p.grad.abs().sum().item() == 0.0:
-            no_grad.append(name)
+            no_grad_unexpected.append(name)
             continue
         n_with_grad += 1
 
     # Verify policy got nothing
     policy_has_grad = any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in policy.parameters())
-    if policy_has_grad:
-        return CheckResult(
-            "6. FQE: gradient flows to fqe_model only, never policy_model", "FAIL",
-            "policy_model has non-zero grads after fqe backward",
-        )
 
-    if no_grad:
+    issues = []
+    if policy_has_grad:
+        issues.append("policy_model has non-zero grads after fqe backward")
+    if unexpected_grad:
+        issues.append(
+            f"{len(unexpected_grad)} shallow/V-head params unexpectedly have gradient — "
+            f"someone may have re-added shallow losses to FQE: {unexpected_grad[:5]}"
+        )
+    if no_grad_unexpected:
+        issues.append(f"{len(no_grad_unexpected)} expected-trainable params got no gradient: {no_grad_unexpected[:5]}")
+
+    if issues:
         return CheckResult(
-            "6. FQE: gradient flows to fqe_model only, never policy_model", "FAIL",
-            f"{n_with_grad} fqe params got grad; {len(no_grad)} unexpected no-grad params",
-            detail=f"no-grad fqe params (first 5): {no_grad[:5]}",
+            "6. FQE: gradient flows to q_head_z + encoder only; shallow heads and v_head untrained; policy frozen",
+            "FAIL", "; ".join(issues),
         )
     return CheckResult(
-        "6. FQE: gradient flows to fqe_model only, never policy_model", "PASS",
-        f"{n_with_grad} fqe params got non-zero gradient (v_head expected unused); policy_model unchanged",
+        "6. FQE: gradient flows to q_head_z + encoder only; shallow heads and v_head untrained; policy frozen",
+        "PASS",
+        f"{n_with_grad} expected params got grad; q_head_type/q_head_x/v_head correctly received none; policy_model unchanged",
     )
 
 
@@ -303,6 +330,7 @@ def check_iql_loss_components_separable() -> CheckResult:
     v_next = shift_v_for_next_state(out["v"], batch.valid_mask)
     losses = iql_losses(
         q_type=out["q_type"], q_x=out["q_x"], q_z=out["q_z"],
+        q_x_logits=out["q_x_logits"], q_z_logits=out["q_z_logits"],
         v_current=out["v"], v_next=v_next, reward=batch.reward,
         is_terminal=batch.is_terminal, valid_mask=batch.valid_mask,
         gamma=1.0, tau=0.7,

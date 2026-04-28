@@ -232,6 +232,8 @@ class Trainer:
                 q_type=out["q_type"],
                 q_x=out["q_x"],
                 q_z=out["q_z"],
+                q_x_logits=out["q_x_logits"],
+                q_z_logits=out["q_z_logits"],
                 v_current=out["v"],
                 v_next=v_next,
                 reward=batch.reward,
