@@ -192,3 +192,60 @@ def test_trainer_step_asserts_is_terminal_invariant():
         bad_batch.is_terminal.zero_()
         with _pytest.raises(AssertionError, match="is_terminal invariant violated"):
             trainer.step(bad_batch)
+
+
+def test_trainer_load_checkpoint_warns_on_epochs_mismatch(caplog):
+    """Resuming with a different --epochs than the original silently shifts the
+    cosine LR schedule — must emit a loud warning so the user knows."""
+    import logging
+    model = _tiny_model()
+    train_ds = _SyntheticPADataset(n_items=8)
+    val_ds = _SyntheticPADataset(n_items=4)
+
+    # Original run: epochs=4
+    cfg_orig = TrainerConfig(
+        lr=1e-3, warmup_steps=2, batch_size=4, num_workers=0,
+        epochs=4, bf16=False, pin_memory=False, include_pitcher_blind_eval=False,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        trainer = Trainer(model, train_ds, val_ds, cfg_orig, torch.device("cpu"), Path(tmp))
+        trainer.fit()
+        ckpt = Path(tmp) / "test_ckpt.pt"
+        trainer.save_checkpoint(ckpt)
+
+        # Resume with epochs=8 (different) — should warn
+        model2 = _tiny_model()
+        cfg_resume = TrainerConfig(
+            lr=1e-3, warmup_steps=2, batch_size=4, num_workers=0,
+            epochs=8, bf16=False, pin_memory=False, include_pitcher_blind_eval=False,
+        )
+        trainer2 = Trainer(model2, train_ds, val_ds, cfg_resume, torch.device("cpu"), Path(tmp) / "run2")
+        with caplog.at_level(logging.WARNING, logger="src.trainer"):
+            trainer2.load_checkpoint(ckpt)
+        assert any("EPOCHS MISMATCH ON RESUME" in r.message for r in caplog.records), \
+            "expected warning about epochs mismatch on resume"
+
+
+def test_trainer_load_checkpoint_silent_when_epochs_match(caplog):
+    """Same --epochs on resume = no warning (the standard usage pattern)."""
+    import logging
+    model = _tiny_model()
+    train_ds = _SyntheticPADataset(n_items=8)
+    val_ds = _SyntheticPADataset(n_items=4)
+
+    cfg = TrainerConfig(
+        lr=1e-3, warmup_steps=2, batch_size=4, num_workers=0,
+        epochs=4, bf16=False, pin_memory=False, include_pitcher_blind_eval=False,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        trainer = Trainer(model, train_ds, val_ds, cfg, torch.device("cpu"), Path(tmp))
+        trainer.fit()
+        ckpt = Path(tmp) / "test_ckpt.pt"
+        trainer.save_checkpoint(ckpt)
+
+        model2 = _tiny_model()
+        trainer2 = Trainer(model2, train_ds, val_ds, cfg, torch.device("cpu"), Path(tmp) / "run2")
+        with caplog.at_level(logging.WARNING, logger="src.trainer"):
+            trainer2.load_checkpoint(ckpt)
+        assert not any("EPOCHS MISMATCH" in r.message for r in caplog.records), \
+            "should not warn when epochs match"

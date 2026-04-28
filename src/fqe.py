@@ -107,11 +107,21 @@ def fqe_loss(
     with torch.no_grad():
         rmask = repertoire_mask_from_batch(batch, repertoire_mask_min_count)
         policy_out = policy_model.policy(batch, repertoire_mask=rmask)
-        q_z_at_policy = _gather_qz_at_actions(
-            fqe_model, h_fqe,
-            batch.arsenal_per_type, batch.batter_per_type,
-            policy_out["pitch_type"], policy_out["x_bin"], policy_out["z_bin"],
-        )
+        # Put fqe_model in eval mode for the TARGET-side forward to silence
+        # dropout. Prediction (q_z above) and target (q_z_at_policy) would
+        # otherwise see independent dropout masks at q_head_z, inflating
+        # target variance unnecessarily. Restore prior mode on exit.
+        was_training = fqe_model.training
+        fqe_model.eval()
+        try:
+            q_z_at_policy = _gather_qz_at_actions(
+                fqe_model, h_fqe,
+                batch.arsenal_per_type, batch.batter_per_type,
+                policy_out["pitch_type"], policy_out["x_bin"], policy_out["z_bin"],
+            )
+        finally:
+            if was_training:
+                fqe_model.train()
 
     # Shift left by one to get Q^π(s_{t+1}, π_learned(s_{t+1})).
     q_next = torch.zeros_like(q_z_at_policy)

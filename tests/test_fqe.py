@@ -255,3 +255,55 @@ def test_fqe_trainer_config_default_mask_disabled():
     cfg = FQETrainerConfig()
     assert cfg.repertoire_mask_min_count == 0, \
         "default repertoire_mask_min_count must be 0 (disabled); see CLAUDE.md design rationale"
+
+
+def test_fqe_target_dropout_silenced_in_target_forward():
+    """fqe_loss should put fqe_model in eval mode for the target-side forward
+    so the q_head_z MLP's dropout doesn't fire on the target. We verify by
+    spying on heads_chosen and capturing fqe.training at each call site.
+
+    Note: encoder/transformer h_fqe is shared between prediction and target
+    sides (computed once, reused), so encoder dropout is NOT independently
+    drawn on the target side. The vulnerability is specifically in the head
+    MLPs' dropout layers, which run twice (once per gather call).
+    """
+    import types
+    fqe = _tiny_model()
+    policy = _tiny_model()
+    for p in policy.parameters():
+        p.requires_grad_(False)
+    fqe.train()
+    assert fqe.training is True
+    batch = _make_batch()
+
+    captured_modes: list[bool] = []
+    original_heads_chosen = fqe.heads_chosen.__func__
+
+    def spy(self, *args, **kwargs):
+        captured_modes.append(self.training)
+        return original_heads_chosen(self, *args, **kwargs)
+
+    fqe.heads_chosen = types.MethodType(spy, fqe)
+    try:
+        fqe_loss(fqe, policy, batch, gamma=1.0)
+    finally:
+        del fqe.heads_chosen  # restore the bound method to the class one
+
+    # Two heads_chosen calls in fqe_loss: first for chosen actions (prediction),
+    # second for policy actions (target). We expect:
+    #   - first call: training=True (dropout active for prediction)
+    #   - second call: training=False (dropout silenced for target)
+    assert captured_modes == [True, False], (
+        f"heads_chosen training modes were {captured_modes}, expected [True, False] "
+        "(prediction in train mode, target in eval mode)"
+    )
+
+
+def test_fqe_loss_restores_train_mode_after_call():
+    """The target-forward eval-mode wrapper must restore the prior mode."""
+    fqe = _tiny_model()
+    policy = _tiny_model()
+    batch = _make_batch()
+    fqe.train()
+    fqe_loss(fqe, policy, batch, gamma=1.0)
+    assert fqe.training is True, "fqe_model should be back in train mode after fqe_loss"

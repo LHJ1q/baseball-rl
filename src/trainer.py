@@ -295,6 +295,33 @@ class Trainer:
         logger.info("resumed from %s: epoch=%d step=%d best_val_q=%.4f",
                     path, self.epoch, self.global_step, self.best_val_q_loss)
 
+        # Defensive guard against silent LR-schedule reinterpretation on resume.
+        # cosine_warmup_lr is parameterized by total_steps, which is recomputed
+        # from cfg.epochs in __init__. If the user resumes with a different
+        # --epochs than the original, the cosine schedule shifts and the LR
+        # jumps at the resume point with NO log signal. Warn loudly.
+        saved_cfg = payload.get("trainer_cfg") or {}
+        saved_epochs = saved_cfg.get("epochs")
+        if saved_epochs is not None and saved_epochs != self.cfg.epochs:
+            saved_total = self.steps_per_epoch * saved_epochs
+            old_lr = cosine_warmup_lr(
+                self.global_step, base_lr=self.cfg.lr,
+                warmup_steps=self.cfg.warmup_steps, total_steps=saved_total,
+            )
+            new_lr = cosine_warmup_lr(
+                self.global_step, base_lr=self.cfg.lr,
+                warmup_steps=self.cfg.warmup_steps, total_steps=self.total_steps,
+            )
+            logger.warning(
+                "EPOCHS MISMATCH ON RESUME: checkpoint trained with epochs=%d, "
+                "current cfg.epochs=%d. Cosine LR schedule reinterpreted: at "
+                "global_step=%d, lr was %.2e under old schedule, now %.2e under "
+                "new schedule (delta = %+.2e). If unintended, restart with the "
+                "original --epochs to preserve the schedule.",
+                saved_epochs, self.cfg.epochs, self.global_step, old_lr, new_lr,
+                new_lr - old_lr,
+            )
+
     # --------------------------------------------------------------------- #
     # Main loop
     # --------------------------------------------------------------------- #
