@@ -449,6 +449,10 @@ class FQETrainer:
                     time.time() - t0,
                 )
 
+                # Bump self.epoch to 'next epoch to run' BEFORE save (matches
+                # the off-by-one fix in src/trainer.py — keeps semantics the
+                # same in case FQETrainer ever grows --resume).
+                self.epoch = epoch_idx + 1
                 self.save_checkpoint(self.run_dir / "fqe_checkpoint_latest.pt")
                 if (epoch_idx + 1) % self.cfg.checkpoint_every_epochs == 0:
                     self.save_checkpoint(self.run_dir / f"fqe_checkpoint_epoch_{epoch_idx}.pt")
