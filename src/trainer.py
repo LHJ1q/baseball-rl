@@ -426,7 +426,12 @@ class Trainer:
                 })
                 self._log_eval_summary(epoch_idx, avg, eval_metrics, time.time() - t0)
 
-                # Checkpointing
+                # Mark this epoch as completed BEFORE saving so the persisted
+                # `self.epoch` is the next epoch to run. Without this bump,
+                # resume's `range(self.epoch, cfg.epochs)` re-runs the just-
+                # completed epoch (re-trains data the model already saw and
+                # advances the LR schedule past where it should be).
+                self.epoch = epoch_idx + 1
                 self.save_checkpoint(self.ckpt_latest)
                 if (epoch_idx + 1) % self.cfg.checkpoint_every_epochs == 0:
                     self.save_checkpoint(self.run_dir / f"checkpoint_epoch_{epoch_idx}.pt")

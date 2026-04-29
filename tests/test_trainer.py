@@ -246,6 +246,37 @@ def test_trainer_load_checkpoint_warns_on_epochs_mismatch(caplog):
             "expected warning about epochs mismatch on resume"
 
 
+def test_resume_does_not_repeat_completed_epoch():
+    """Saved checkpoint's self.epoch must mean 'next epoch to run', not
+    'last completed epoch'. Otherwise resume re-trains the last epoch:
+    re-uses already-seen data AND advances the LR schedule past where it
+    should be (each re-run epoch adds steps_per_epoch to global_step)."""
+    model = _tiny_model()
+    train_ds = _SyntheticPADataset(n_items=16)
+    val_ds = _SyntheticPADataset(n_items=4)
+    cfg = TrainerConfig(
+        lr=1e-3, warmup_steps=2, batch_size=4, num_workers=0,
+        epochs=3, bf16=False, pin_memory=False, include_pitcher_blind_eval=False,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        trainer = Trainer(model, train_ds, val_ds, cfg, torch.device("cpu"), Path(tmp))
+        trainer.fit()
+        completed_steps = trainer.global_step
+        ckpt = Path(tmp) / "test_ckpt.pt"
+        trainer.save_checkpoint(ckpt)
+
+        # Resume with the SAME epoch count → range(self.epoch, cfg.epochs) must
+        # be empty; the resumed trainer should do zero additional steps.
+        model2 = _tiny_model()
+        trainer2 = Trainer(model2, train_ds, val_ds, cfg, torch.device("cpu"), Path(tmp) / "run2")
+        trainer2.load_checkpoint(ckpt)
+        trainer2.fit()
+        assert trainer2.global_step == completed_steps, (
+            f"resume re-ran a completed epoch: started at step {completed_steps}, "
+            f"ended at step {trainer2.global_step} (expected no additional steps)"
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile only enabled on CUDA")
 def test_compile_checkpoint_roundtrip():
     """Save from a torch.compile()'d model, load into an uncompiled model — outputs match.
