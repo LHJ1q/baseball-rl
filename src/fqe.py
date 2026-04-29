@@ -25,6 +25,7 @@ import csv
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -385,6 +386,10 @@ class FQETrainer:
         # is a defensive no-op kept for forward-compat in case the wrap shape
         # changes; getattr falls through to fqe_model when _orig_mod is absent.
         underlying = getattr(self.fqe_model, "_orig_mod", self.fqe_model)
+        # Atomic save: write to .tmp then os.replace. torch.save is non-atomic;
+        # a crash mid-write (SIGKILL, OOM, power loss) would leave a truncated
+        # ckpt that can't be loaded. os.replace is atomic on POSIX + Windows.
+        tmp = path.with_suffix(path.suffix + ".tmp")
         torch.save(
             {
                 "model": underlying.state_dict(),
@@ -393,8 +398,9 @@ class FQETrainer:
                 "epoch": self.epoch,
                 "trainer_cfg": asdict(self.cfg),
             },
-            path,
+            tmp,
         )
+        os.replace(tmp, path)
 
     def fit(self) -> dict[str, float]:
         try:

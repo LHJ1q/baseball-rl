@@ -19,6 +19,7 @@ import csv
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -333,7 +334,13 @@ class Trainer:
             "best_val_q_loss": self.best_val_q_loss,
             "trainer_cfg": asdict(self.cfg),
         }
-        torch.save(payload, path)
+        # Atomic save: write to .tmp then rename. torch.save itself is NOT
+        # atomic — a crash mid-write (SIGKILL, OOM, power loss) leaves a
+        # truncated file at `path`, which breaks --resume on next launch.
+        # os.replace is atomic on POSIX (and on Windows since Py 3.3).
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
 
     def load_checkpoint(self, path: Path) -> None:
         payload = torch.load(path, map_location=self.device, weights_only=False)
