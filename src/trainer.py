@@ -201,11 +201,18 @@ class Trainer:
         self.ckpt_latest = self.run_dir / "checkpoint_latest.pt"
         self.ckpt_best = self.run_dir / "checkpoint_best.pt"
 
-        # CSV logging
+        # CSV logging — pre-declare the FULL column union so train rows AND
+        # eval rows share the same schema. Without this, _ensure_csv would
+        # lock _metrics_columns to whatever the FIRST row carried (the train
+        # step at global_step=1, which has no eval-only fields), and every
+        # subsequent eval row's pitcher-blind diagnostics + train averages +
+        # elapsed_s would be silently filtered out by _log_row's column-set
+        # intersection. Pre-declaring locks the schema before any row arrives.
         self.metrics_path = self.run_dir / "metrics.csv"
         self._csv_file = None
         self._csv_writer = None
         self._metrics_columns: list[str] | None = None
+        self._csv_columns_full = self._build_csv_columns()
 
         # State
         self.global_step = 0
@@ -221,6 +228,22 @@ class Trainer:
     # CSV logging
     # --------------------------------------------------------------------- #
 
+    def _build_csv_columns(self) -> list[str]:
+        """Full column union — train rows, end-of-epoch eval rows, and
+        intra-epoch eval rows all serialize through this superset. Missing
+        fields per row become empty strings so the CSV stays rectangular."""
+        cols = [
+            "phase", "epoch", "step",
+            # Train-step + shared eval (single-batch losses)
+            "q_loss", "v_loss", "lr", "grad_norm",
+            # End-of-epoch eval averages
+            "train_avg_q_loss", "train_avg_v_loss", "train_avg_lr", "train_avg_grad_norm",
+            "elapsed_s",
+        ]
+        if self.cfg.include_pitcher_blind_eval:
+            cols += ["q_loss_blind", "v_loss_blind", "q_loss_blind_gap"]
+        return cols
+
     def _ensure_csv(self, columns: list[str]) -> None:
         if self._csv_writer is not None:
             return
@@ -233,9 +256,10 @@ class Trainer:
             self._csv_file.flush()
 
     def _log_row(self, row: dict) -> None:
-        # Stable column set: union of seen columns, padded with empty strings.
+        # Lazy-open the CSV with the FULL pre-declared column set, not the
+        # first row's keys (which would silently drop eval-only columns).
         if self._metrics_columns is None:
-            self._ensure_csv(sorted(row.keys()))
+            self._ensure_csv(self._csv_columns_full)
         # Coerce missing columns to empty strings to keep CSV well-formed.
         full = {c: row.get(c, "") for c in self._metrics_columns}
         self._csv_writer.writerow(full)
@@ -359,11 +383,21 @@ class Trainer:
                     path, self.epoch, self.global_step, self.best_val_q_loss)
 
         # Defensive guard against silent LR-schedule reinterpretation on resume.
-        # cosine_warmup_lr is parameterized by total_steps, which is recomputed
-        # from cfg.epochs in __init__. If the user resumes with a different
-        # --epochs than the original, the cosine schedule shifts and the LR
-        # jumps at the resume point with NO log signal. Warn loudly.
+        # cosine_warmup_lr depends on (lr, warmup_steps, total_steps, min_lr_factor),
+        # and total_steps = steps_per_epoch * epochs where steps_per_epoch is
+        # determined by batch_size + dataset size. Any of these changing on
+        # resume shifts the schedule with NO log signal. Warn for each drift.
         saved_cfg = payload.get("trainer_cfg") or {}
+        for field_name in ("batch_size", "lr", "warmup_steps", "min_lr_factor"):
+            saved_v = saved_cfg.get(field_name)
+            current_v = getattr(self.cfg, field_name, None)
+            if saved_v is not None and saved_v != current_v:
+                logger.warning(
+                    "RESUME CFG DRIFT: %s changed from saved=%r to current=%r. "
+                    "This affects the LR schedule and/or optimizer behavior; if "
+                    "unintended, restart with the original value.",
+                    field_name, saved_v, current_v,
+                )
         saved_epochs = saved_cfg.get("epochs")
         if saved_epochs is not None and saved_epochs != self.cfg.epochs:
             saved_total = self.steps_per_epoch * saved_epochs

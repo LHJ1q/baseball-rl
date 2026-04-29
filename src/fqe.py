@@ -271,10 +271,23 @@ class FQETrainer:
 
         self._use_bf16 = cfg.bf16 and self.device.type == "cuda"
 
+        # CSV logging — see Trainer._build_csv_columns for why the column union
+        # is pre-declared. Same bug class would silently drop eval rows' val_*
+        # and train_avg_* columns if we let _ensure_csv lock to the first
+        # train-step row's keys.
         self.metrics_path = self.run_dir / "fqe_metrics.csv"
         self._csv_file = None
         self._csv_writer = None
         self._metrics_columns: list[str] | None = None
+        self._csv_columns_full = [
+            "phase", "epoch", "step",
+            # Train-step
+            "fqe_loss", "q_mean", "target_mean", "lr", "grad_norm",
+            # Eval averages (val_* prefix from fit())
+            "train_avg_fqe_loss", "train_avg_q_mean", "train_avg_target_mean",
+            "val_fqe_loss", "val_q_mean", "val_target_mean",
+            "elapsed_s",
+        ]
 
         self.global_step = 0
         self.epoch = 0
@@ -293,8 +306,10 @@ class FQETrainer:
             self._csv_file.flush()
 
     def _log_row(self, row: dict) -> None:
+        # Lazy-open the CSV with the FULL pre-declared column set, not the
+        # first row's keys (which would silently drop eval-only columns).
         if self._metrics_columns is None:
-            self._ensure_csv(sorted(row.keys()))
+            self._ensure_csv(self._csv_columns_full)
         full = {c: row.get(c, "") for c in self._metrics_columns}
         self._csv_writer.writerow(full)
         self._csv_file.flush()

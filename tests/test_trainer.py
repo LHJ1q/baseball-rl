@@ -170,6 +170,29 @@ def test_trainer_checkpoint_roundtrip():
         torch.testing.assert_close(out1, out2)
 
 
+def test_trainer_metrics_csv_includes_eval_columns():
+    """Regression: metrics.csv must capture eval-only columns (pitcher-blind
+    diagnostics, train averages, elapsed_s) — not just train-step columns.
+    Bug was: _ensure_csv locked _metrics_columns to the FIRST row's keys
+    (a train step with no eval fields), silently filtering eval rows down
+    to the train-step subset and dropping the diagnostics."""
+    model = _tiny_model()
+    train_ds = _SyntheticPADataset(n_items=16)
+    val_ds = _SyntheticPADataset(n_items=4)
+    cfg = TrainerConfig(
+        lr=1e-3, warmup_steps=2, batch_size=4, num_workers=0,
+        epochs=1, bf16=False, pin_memory=False, include_pitcher_blind_eval=True,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "test_run"
+        trainer = Trainer(model, train_ds, val_ds, cfg, torch.device("cpu"), run_dir)
+        trainer.fit()
+        header = (run_dir / "metrics.csv").read_text().splitlines()[0].split(",")
+        for col in ("q_loss_blind", "v_loss_blind", "q_loss_blind_gap",
+                    "train_avg_q_loss", "elapsed_s"):
+            assert col in header, f"missing eval column '{col}' in metrics CSV header: {header}"
+
+
 def test_trainer_metrics_csv_is_written():
     model = _tiny_model()
     train_ds = _SyntheticPADataset(n_items=16)
