@@ -220,9 +220,17 @@ class Trainer:
         self.best_val_q_loss = float("inf")
 
         # Save config payload (encoder + qtransformer + trainer) for reproducibility.
+        # Write config.json only if it doesn't already exist — on resume we want
+        # to preserve the ORIGINAL training cfg as the ground-truth record. Any
+        # cfg drift introduced by --resume gets surfaced via the load_checkpoint
+        # warning instead, and the saved checkpoint's own trainer_cfg payload
+        # tracks per-checkpoint state. If we re-wrote config.json here, a resume
+        # with --lr different would silently lose the original LR.
         if encoder_q_config_payload is not None:
-            cfg_payload = {**encoder_q_config_payload, "trainer": asdict(cfg)}
-            (self.run_dir / "config.json").write_text(json.dumps(cfg_payload, indent=2))
+            cfg_path = self.run_dir / "config.json"
+            if not cfg_path.exists():
+                cfg_payload = {**encoder_q_config_payload, "trainer": asdict(cfg)}
+                cfg_path.write_text(json.dumps(cfg_payload, indent=2))
 
     # --------------------------------------------------------------------- #
     # CSV logging
