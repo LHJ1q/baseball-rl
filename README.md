@@ -44,15 +44,6 @@ pip install -e ".[dev]"
 **GPU compatibility.** The trainer auto-detects CUDA / MPS / CPU and turns on
 BF16 autocast + `torch.compile` + TF32 only on CUDA. Verified GPU targets:
 
-| GPU | Arch | BF16 | FlashAttention (SDPA) | `torch.compile` | Notes |
-|---|---|---|---|---|---|
-| **RTX Pro 4500** | Blackwell (sm_120) | ✅ | ✅ | ✅ | Needs PyTorch ≥ 2.7 with cu128 wheels (the conda env file pins `pytorch-cuda=12.8`). |
-| **A100 40 GB / 80 GB** | Ampere (sm_80) | ✅ | ✅ | ✅ | Works on cu121 / cu124 / cu128. Drop `--batch-size` to 512 on the 40 GB card if VRAM tight. |
-| Macbook M-series | MPS | fp32 only | n/a | auto-skipped | Smoke tests + tiny `--smoke-train` only; not for full training. |
-| CPU | — | fp32 | n/a | auto-skipped | Smoke tests only. |
-
-Both production GPUs run the v1 preset comfortably at batch 512–1024 PAs. End-to-end wall-clock is dataloader-bound (~1–2 hours for 40 epochs) on either.
-
 ## Reproduce — five-season run (2021–2025)
 
 ```bash
